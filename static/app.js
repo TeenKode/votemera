@@ -251,37 +251,46 @@ function renderDisplay(){
  if(['analysis','analysis_compare'].includes(s.display)){renderCross(s);return}
  clearInterval(crossTimer);crossTimer=null;crossScope='';
  const qs=s.event.questions, allRounds=s.display==='compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);
+ const comparison=allRounds.length>1?[allRounds[0],allRounds.at(-1)]:null;
  const ordered=s.event.presentation?.order?.length?s.event.presentation.order:qs.map((_,i)=>i);
  const roundSize=s.display==='compare'?2:1,roundPages=Math.max(1,Math.ceil(allRounds.length/roundSize));
  const pageSize=screenPageSize(s,ordered,Math.min(roundSize,allRounds.length));
  const pageScope=JSON.stringify([s.event.id,s.display,qs,ordered,s.scenarioQuestion]);
  if(displayPageScope!==pageScope){displayPageScope=pageScope;displayPage=0;displayFocus=-1}
- if(displayFocus>=qs.length||(!ordered.includes(displayFocus)&&displayFocus!==-1))displayFocus=-1;if(s.scenarioQuestion>=0)displayFocus=s.scenarioQuestion;
+ if(displayFocus>=qs.length||(!ordered.includes(displayFocus)&&displayFocus!==-1))displayFocus=-1;
+ if(s.scenarioQuestion>=0&&ordered.includes(s.scenarioQuestion))displayFocus=s.scenarioQuestion;
  const questionPages=displayFocus===-1?Math.max(1,Math.ceil(ordered.length/pageSize)):1,pages=questionPages*roundPages;
  displayPage=Math.min(displayPage,pages-1);
  const questionPage=displayPage%questionPages,roundPage=Math.floor(displayPage/questionPages);
  const rounds=allRounds.slice(roundPage*roundSize,(roundPage+1)*roundSize);
  const indices=displayFocus===-1?ordered.slice(questionPage*pageSize,(questionPage+1)*pageSize):[displayFocus];
  const sig=JSON.stringify([s.event.id,s.event.title,qs,s.display,s.settings,s.external?.stale,!!s.external?.last_sync,rounds.map(r=>[r.id,r.name]),s.opened,displayFocus,displayPage,ordered,s.scenarioQuestion,s.scenario,pageSize,pages]);
- if(main.dataset.sig===sig){if(s.display!=='hidden'){for(const i of indices){for(const r of rounds)updateChart(r,s,i);updateDelta(s,rounds,i)}updateTotals(rounds)}return}
+ if(main.dataset.sig===sig){if(s.display!=='hidden'){for(const i of indices){for(const r of rounds)updateChart(r,s,i);if(comparison)updateDelta(s,comparison,i)}updateTotals(rounds)}return}
  clearInterval(rotateTimer);main.dataset.sig=sig;main.className='display-main'+(indices.length===1?' spotlight':'')+(s.display==='compare'?' compare-mode':'');
  const top=el('div','display-heading');const labels=el('div');labels.append(el('div','eyebrow',s.external?'Яндекс Формы · онлайн':s.display==='compare'?'Сравнение этапов':s.opened?'Голосование открыто':'Голосование завершено'),el('h1','',s.event.title));top.append(labels);
  main.replaceChildren(top);
  if(s.external&&s.display!=='hidden')main.append(el('p','notice external-status',!s.external.last_sync?'Ожидание первой синхронизации с Яндекс Формами':s.external.stale?'Яндекс Формы: показаны последние сохранённые результаты':'Яндекс Формы: автоматическая синхронизация'));
  if(s.display==='hidden'){main.append(add(el('div','center wait'),el('h2','','Результаты пока скрыты'),el('p','muted','Они появятся по решению организатора')));return}
  const totals=el('div','display-totals');for(const r of rounds){const tile=el('div','total-tile');tile.append(el('span','',r.name),el('strong','total-number','0'),el('small','','Участников'));tile.dataset.round=r.id;totals.append(tile)}top.append(totals);updateTotals(rounds);
- if((ordered.length>1&&!s.scenario)||pages>1){const controls=el('div','display-controls');if(ordered.length>1&&!s.scenario){const picker=select(controls,'Вопрос',[[-1,'Обзор вопросов'],...ordered.map(i=>[i,(i+1)+'. '+qs[i].question])],displayFocus);picker.onchange=()=>{displayFocus=+picker.value;displayPage=0;renderDisplay()}}if(pages>1){const nav=el('div','display-nav');nav.append(btn('‹',()=>{displayPage=(displayPage+pages-1)%pages;renderDisplay()}),el('span','muted',`${displayPage+1} / ${pages}`),btn('›',()=>{displayPage=(displayPage+1)%pages;renderDisplay()}));controls.append(nav);if(s.settings.display_rotate>0)rotateTimer=setInterval(()=>{displayPage=(displayPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}main.append(controls)}
+ if((ordered.length>1&&!s.scenario)||pages>1){const controls=el('div','display-controls');if(ordered.length>1&&!s.scenario){const picker=select(controls,'Вопрос',[[-1,'Обзор вопросов'],...ordered.map(i=>[i,(i+1)+'. '+qs[i].question])],displayFocus);picker.onchange=()=>{displayFocus=+picker.value;displayPage=0;renderDisplay()}}if(pages>1){
+  const nav=el('div','display-nav');
+  const go=step=>{displayPage=(displayPage+pages+step)%pages;renderDisplay()};
+  const previous=btn('‹',()=>go(-1)),next=btn('›',()=>go(1));
+  previous.setAttribute('aria-label','Предыдущая страница');next.setAttribute('aria-label','Следующая страница');
+  nav.append(previous,el('span','muted',`${displayPage+1} / ${pages}`),next);controls.append(nav);
+  if(s.settings.display_rotate>0)rotateTimer=setInterval(()=>go(1),s.settings.display_rotate*1000);
+ }main.append(controls)}
  const grid=el('div',indices.length>1?'question-grid':'question-single');grid.dataset.size=indices.length;main.append(grid);
  for(const i of indices){const q=qs[i],chart=q.multi?'bars':s.settings.chart,group=el('section','question-group');group.style.setProperty('--order',indices.indexOf(i));group.append(el('div','question-kicker','ВОПРОС '+String(i+1).padStart(2,'0')),el('h2','',q.question));if(q.multi)group.append(el('p','muted','Множественный выбор · доля ответивших'));
  const panels=el('div','round-panels');group.append(panels);grid.append(group);
  for(const r of rounds){const panel=el('section','panel result-panel');panel.id='round-'+r.id+'-'+i;panel.append(add(el('div','round-title'),el('strong','',r.name),el('span','total')));
  const stats=el('div','stats result-stats');for(const o of q.options){const metric=el('div','metric');metric.style.setProperty('--option-color',o.color);metric.append(add(el('span','metric-label'),el('i','swatch'),el('span','',o.label)),add(el('div','metric-values'),el('b','count'),el('small','share')));if(chart==='bars'){const bar=el('div','bar'),seg=el('div','segment');seg.style.background=o.color;seg.style.width='0%';bar.append(seg);metric.append(bar)}stats.append(metric)}if(chart==='donut'){const donut=el('div','donut');donut.setAttribute('role','img');donut.setAttribute('aria-label','Распределение ответов');panel.append(add(el('div','donut-layout'),donut,stats))}else panel.append(stats);
  if(chart==='stack'){const bar=el('div','stack');for(const o of q.options){const seg=el('div','segment');seg.style.background=o.color;seg.style.width='0%';bar.append(seg)}panel.append(bar)}panels.append(panel);updateChart(r,s,i)}
- if(rounds.length>1){const delta=el('section','delta-panel');delta.id='delta-'+i;group.append(delta);updateDelta(s,rounds,i)}}
+ if(comparison){const delta=el('section','delta-panel');delta.id='delta-'+i;group.append(delta);updateDelta(s,comparison,i)}}
 }
 function updateTotals(rounds){for(const t of main.querySelectorAll('.total-tile')){const r=rounds.find(x=>String(x.id)===t.dataset.round);numeric(t.querySelector('.total-number'),r?.total??0,countText)}}
 function updateChart(r,s,i){const panel=$('round-'+r.id+'-'+i),res=r.results?.[i];if(!panel||!res)return;panel.querySelector('.total').textContent='Ответили: '+res.total+' из '+r.total;panel.querySelectorAll('.count').forEach((n,j)=>{n.hidden=!s.settings.show_count;numeric(n,res.counts[j],countText)});panel.querySelectorAll('.share').forEach((n,j)=>{n.hidden=!s.settings.show_percent;numeric(n,pct(res.counts[j],res.total),shareText)});panel.querySelectorAll('.segment').forEach((n,j)=>{n.style.width=pct(res.counts[j],res.total)+'%'});const donut=panel.querySelector('.donut');if(donut){let start=0;const stops=res.counts.map((n,j)=>{const end=start+pct(n,res.total);const value=s.event.questions[i].options[j].color+' '+start+'% '+end+'%';start=end;return value});donut.style.background=res.total?'conic-gradient('+stops.join(',')+')':'var(--line)';donut.setAttribute('aria-label',s.event.questions[i].options.map((o,j)=>o.label+': '+fmt(pct(res.counts[j],res.total))+'%').join(', '))}}
-function updateDelta(s,rounds,i){const node=$('delta-'+i);if(!node)return;const a=rounds[0],b=rounds.at(-1),ar=a.results[i],br=b.results[i],view=el('section','delta-panel');view.id=node.id;view.append(el('h3','','Изменение: '+a.name+' → '+b.name));if(!ar.total||!br.total){view.append(el('p','muted','Для сравнения нужны голоса в обоих этапах'));patchView(node,view);return}const row=el('div','delta');s.event.questions[i].options.forEach((o,j)=>{const diff=br.counts[j]-ar.counts[j],dp=pct(br.counts[j],br.total)-pct(ar.counts[j],ar.total);row.append(add(el('div'),el('span','',o.label),el('b','',(diff>0?'+':'')+diff+' голосов'),el('small','muted',(dp>0?'+':'')+fmt(dp)+' п. п.')))});view.append(row,el('p','muted','Разница общих результатов, не число участников, изменивших мнение.'));patchView(node,view)}
+function updateDelta(s,[first,last],i){const node=$('delta-'+i);if(!node)return;const ar=first.results[i],br=last.results[i],view=el('section','delta-panel');view.id=node.id;view.append(el('h3','','Изменение: '+first.name+' → '+last.name));if(!ar.total||!br.total){view.append(el('p','muted','Для сравнения нужны голоса в обоих этапах'));patchView(node,view);return}const row=el('div','delta');s.event.questions[i].options.forEach((o,j)=>{const diff=br.counts[j]-ar.counts[j],dp=pct(br.counts[j],br.total)-pct(ar.counts[j],ar.total);row.append(add(el('div'),el('span','',o.label),el('b','',(diff>0?'+':'')+diff+' голосов'),el('small','muted',(dp>0?'+':'')+fmt(dp)+' п. п.')))});view.append(row,el('p','muted','Разница общих результатов, не число участников, изменивших мнение.'));patchView(node,view)}
 let heartbeatBusy=false;
 async function heartbeat(){if(mode!=='vote'||!online||heartbeatBusy||(state?.terminal_key_required&&!key))return;heartbeatBusy=true;const sentKey=key;
  try{const d=await(await api('/api/terminal/heartbeat','POST',{terminal})).json();const locked=!!d.locked;if(deviceRevision===null)deviceRevision=Number(sessionStorage.getItem('votemera-device-revision')||0);if(d.revision!==undefined&&d.revision>deviceRevision){sessionStorage.setItem('votemera-device-revision',d.revision);location.reload();return}if(locked!==deviceLocked){deviceLocked=locked;renderVote()}}catch(e){if(e.status===403&&key===sentKey){key='';sessionStorage.removeItem('votemera-key');toast('Ключ терминала отключён или неверен');renderVote()}}finally{heartbeatBusy=false}
@@ -404,16 +413,23 @@ function eventManager(parent,s,editor){
  if(!sandbox)actions.append(btn('PDF',()=>downloadAdmin('/api/admin/report/'+e.id+'/pdf','votemera-'+e.id+'.pdf')),btn('Excel',()=>downloadAdmin('/api/admin/report/'+e.id+'/xlsx','votemera-'+e.id+'.xlsx')));
  row.append(meta,actions);list.append(row)}if(!list.children.length)list.append(el('p','muted','Мероприятий не найдено'))}search.oninput=draw;filter.onchange=()=>{sessionStorage.setItem('votemera-event-filter',filter.value);draw()};draw();
 }
-function adminControls(parent,s,editor){
+function adminControls(parent,s){
  const control=el('section','panel');control.append(el('h2','',s.external?'Яндекс Формы · управление показом':'Управление мероприятием'));parent.append(control);
  if(s.external){control.append(el('p','muted',s.event.title+' · Приём ответов управляется в Яндекс Формах.'),add(el('div','actions'),btn('Интеграции',()=>showAdminSection('integrations')),btn('Выбрать другое мероприятие',()=>showAdminSection('events'))));return}
  const event=select(control,'Мероприятие',s.events.filter(e=>!e.archived&&!e.template||e.id===s.event.id).map(e=>[e.id,e.title]),s.event.id),round=select(control,'Этап',s.event.rounds.map(r=>[r.id,r.name]),s.round);
- const status=el('p','notice',s.opened?'Сейчас голосование открыто':'Сейчас голосование закрыто');control.append(status);const duration=field(control,'Таймер, минут (0 — без ограничения)',0,'number');duration.min=0;duration.max=1440;
+ const status=el('p','notice');status.setAttribute('role','status');control.append(status);
+ const updateStatus=f=>{
+  const text=f.event?.id!==s.event.id?'Активное мероприятие изменилось. Обновите админку.':f.opened?'Сейчас голосование открыто':'Сейчас голосование закрыто';
+  if(status.textContent!==text)status.textContent=text;
+ };
+ updateStatus(s);
+ const duration=field(control,'Таймер, минут (0 — без ограничения)',0,'number');duration.min=0;duration.max=1440;
  let selected=s.event,requestId=0;
  event.onchange=async()=>{const id=++requestId;round.disabled=true;try{const next=await(await api('/api/admin/event/'+event.value,'GET',undefined,true)).json();if(id!==requestId)return;selected=next;round.replaceChildren(...selected.rounds.map(r=>{const o=el('option','',r.name);o.value=r.id;return o}));round.disabled=false}catch(e){toast(e.message)}};
  const set=open=>{if(round.disabled)return toast('Дождитесь загрузки этапов');const seconds=Math.round(Number(duration.value)*60);if(!Number.isFinite(seconds)||seconds<0||seconds>86400)return toast('Неверное время таймера');if(open&&selected.source==='yandex')return toast('Приём ответов управляется в Яндекс Формах. Выберите мероприятие без открытия этапа.');action('/api/admin/control','POST',{event:+event.value,round:+round.value,opened:open,display:+event.value===s.event.id?(adminState?.display||s.display):'hidden',duration:open?seconds:0})};
  control.append(add(el('div','actions'),btn('Открыть этап',()=>set(true),''),btn('Закрыть этап',()=>set(false)),btn('Выбрать без открытия',()=>set(false))),el('p','muted','Управление этапом не меняет режим показа активного мероприятия. Для другого мероприятия экран сначала скрывается.'));
  const hist=el('details','overview-details');hist.append(el('summary','','Очистка данных этапов'));for(const r of s.event.rounds)hist.append(add(el('div','row'),el('span','',r.name),btn('Очистить',()=>{if(confirm('Удалить все голоса этапа «'+r.name+'»?'))action('/api/admin/round/'+r.id+'/votes','DELETE')},'danger')));control.append(hist);
+ return updateStatus;
 }
 
 const DISPLAY_MODES=[['live','Показать результаты','Текущий этап: диаграммы по вопросам'],['hidden','Скрыть результаты','Экран ожидания без статистики'],['compare','Сравнение этапов','Результаты нескольких этапов рядом'],['analysis','Связь ответов','Перекрёстный анализ текущего этапа'],['analysis_compare','Сравнение связей','Перекрёстный анализ всех этапов'],['presentation','Сценарий показа','Автоматическое переключение слайдов']];
@@ -458,7 +474,9 @@ function renderAdmin(){
  const content=el('div','admin-content'),heading=el('div','admin-heading');adminTitle=el('h1');adminDescription=el('p','muted');const links=el('div','links');for(const [url,t] of [['/vote','Открыть терминал'],['/display','Открыть экран'],['/presenter','Пульт ведущего']]){const a=el('a','',t);a.href=url;a.target='_blank';a.rel='noopener';links.append(a)}
  heading.append(add(el('div'),adminTitle,adminDescription),add(el('div','actions'),btn('Обновить',loadAdmin),btn('Выйти',()=>{sessionStorage.removeItem('votemera-admin');token='';clearInterval(adminPoll);login()})));content.append(heading,links);main.append(side,content);
  for(const [id,title] of ADMIN_SECTIONS){const b=btn(title,()=>showAdminSection(id),'admin-nav-button secondary');nav.append(b);adminNav.set(id,b);const section=el('section','admin-section');section.dataset.section=id;section.hidden=true;content.append(section);adminSections.set(id,section)}
- const at=id=>adminSections.get(id);const editor=el('section','panel');eventManager(at('events'),s,editor);at('events').append(editor);editor.hidden=true;adminControls(at('overview'),s,editor);adminLiveUpdates=[displayModePanel(at('overview'),s,true),analyticsOverview(at('overview'),s),displayModePanel(at('display'),s),displayAppearance(at('display'),s)];presentationAdmin(at('display'),s);liveAdmin(at('overview'),s,at('terminals'));
+ const at=id=>adminSections.get(id);const editor=el('section','panel');eventManager(at('events'),s,editor);at('events').append(editor);editor.hidden=true;
+ adminLiveUpdates=[adminControls(at('overview'),s),displayModePanel(at('overview'),s,true),analyticsOverview(at('overview'),s),displayModePanel(at('display'),s),displayAppearance(at('display'),s)].filter(Boolean);
+ presentationAdmin(at('display'),s);liveAdmin(at('overview'),s,at('terminals'));
  keyManager(at('terminals'));adminSettings(at('settings'),s);accessPanel(at('security'));maintenancePanel(at('maintenance'));if(!sandbox){diagnosticPanel(at('maintenance'));auditPanel(at('security'));qrPanel(at('terminals'));}else at('integrations').append(add(el('section','panel'),el('h2','','Яндекс Формы'),el('p','muted','Подключение доступно на локальном сервере. Не вводите реальные OAuth-токены в демоверсии.')));showAdminSection(sessionStorage.getItem('votemera-admin-section')||activeAdminSection);
 }
 

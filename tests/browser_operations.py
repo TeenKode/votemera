@@ -21,17 +21,18 @@ with sync_playwright() as p:
     row=admin.locator('.management-row').filter(has_text='Мастер тест')
     expect(row).to_be_visible()
     row.get_by_role('button',name='Выбрать',exact=True).click()
-    if admin.locator('.admin-section[data-section=overview]').is_visible():
-        pass
+    expect(admin.get_by_label('Мероприятие',exact=True).locator('option:checked')).to_have_text('Мастер тест')
     presenter.goto(BASE+'/presenter');presenter.get_by_label('Пароль администратора').fill('new-password-123');presenter.get_by_role('button',name='Войти').click()
     expect(presenter.get_by_role('heading',name='Пульт ведущего')).to_be_visible()
     presenter.get_by_label('Таймер, минут').fill('1')
     presenter.get_by_role('button',name='Открыть этап').click()
     expect(presenter.get_by_text('Голосование открыто',exact=True)).to_be_visible()
+    expect(admin.get_by_text('Сейчас голосование открыто',exact=True)).to_be_visible()
     presenter.get_by_role('button',name='Скрыть результаты').click()
     assert presenter.request.get(BASE+'/api/admin/state',headers=AUTH).json()['display']=='hidden'
     presenter.get_by_role('button',name='Закрыть этап').click()
     expect(presenter.get_by_text('Голосование закрыто',exact=True)).to_be_visible()
+    expect(admin.get_by_text('Сейчас голосование закрыто',exact=True)).to_be_visible()
     assert not errors,errors
     browser.close()
     print('Operational UI: OK')

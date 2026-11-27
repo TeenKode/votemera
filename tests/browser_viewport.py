@@ -35,16 +35,29 @@ with sync_playwright() as p:
     state=api.post(BASE+'/api/admin/control',headers=AUTH,data=payload).json()
     for i in range(6):
         assert api.post(BASE+'/api/ballot',headers=KEY,data={'round':state['round'],'epoch':state['epoch'],'choices':[i,i,i,i],'nonce':uuid.uuid4().hex,'terminal':uuid.uuid4().hex}).ok
+    last_round=state['event']['rounds'][-1]['id']
+    last=api.post(BASE+'/api/admin/control',headers=AUTH,data={**payload,'round':last_round}).json()
+    assert api.post(BASE+'/api/ballot',headers=KEY,data={'round':last_round,'epoch':last['epoch'],'choices':[5]*4,'nonce':uuid.uuid4().hex,'terminal':uuid.uuid4().hex}).ok
+    assert api.post(BASE+'/api/admin/control',headers=AUTH,data=payload).ok
     vote.goto(BASE+'/vote');vote.once('dialog',lambda d:d.accept('test-key'));vote.get_by_role('button',name='Подключить терминал').click()
     display.goto(BASE+'/display')
     for w,h in SIZES:
         for page in (vote,display):page.set_viewport_size({'width':w,'height':h})
-        fits(vote,'.choice,.vote-nav button,.vote-question')
+        fits(vote,'.choice,.choice-label,.vote-nav button,.vote-question')
         assert vote.locator('.choice').count()==6
         fits(display,'.question-group,.display-nav button,.total-tile')
         assert display.locator('.question-group').count()>=1
     assert api.post(BASE+'/api/admin/control',headers=AUTH,data={**payload,'display':'compare'}).ok
     expect(display.locator('.compare-mode')).to_be_visible()
+    delta=display.locator('.delta-panel')
+    comparison='Изменение: До → Дополнительный этап'
+    expect(delta.locator('h3')).to_have_text(comparison)
+    expect(delta.get_by_text('+83,3 п. п.',exact=True)).to_be_visible()
+    display.locator('.display-controls select').select_option('0')
+    display.get_by_role('button',name='Следующая страница').click()
+    expect(display.locator('.display-totals .total-tile')).to_have_count(1)
+    expect(delta.locator('h3')).to_have_text(comparison)
+    display.get_by_role('button',name='Предыдущая страница').click()
     for w,h in SIZES:
         display.set_viewport_size({'width':w,'height':h})
         fits(display,'.question-group,.delta-panel,.display-nav button')
