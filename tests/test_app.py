@@ -455,7 +455,7 @@ def test_yandex_cloud_org_headers(client,monkeypatch):
         response=client.put('/api/admin/yandex',headers=AUTH,json={'org':org,'token':'OAuth mock-secret-123'})
         assert response.is_success,response.text
         assert client.get('/api/admin/yandex/forms',headers=AUTH).is_success
-        assert client.get('/api/admin/yandex',headers=AUTH).json()['org_header'].lower()==header
+        assert client.get('/api/admin/yandex',headers=AUTH).json()['org_header'].lower()==header.lower()
         for request_headers in captured[-3:]:
             assert request_headers[header.capitalize()]==org
             assert request_headers['Authorization']=='OAuth mock-secret-123'
