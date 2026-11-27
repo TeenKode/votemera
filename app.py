@@ -659,7 +659,7 @@ def control(v:Control):
     with db(True) as c:
         if not c.execute('SELECT 1 FROM events WHERE id=?',(v.event,)).fetchone(): fail(404,'Мероприятие не найдено')
         if meta(c,v.event)['archived']: fail(409,'Сначала восстановите мероприятие из архива')
-        if external_source(c,v.event) and (v.opened or v.display not in ('live','hidden','presentation')): fail(409,'Для Яндекс Форм используйте текущие результаты или скрытие; сбор ответов управляется в Яндексе')
+        if external_source(c,v.event) and (v.opened or v.display not in ('live','hidden')): fail(409,'Для Яндекс Форм используйте текущие результаты или скрытие; сбор ответов управляется в Яндексе')
         if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
         if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
         s=c.execute('SELECT * FROM settings').fetchone()
@@ -685,6 +685,7 @@ def set_presentation(eid:int,v:Presentation):
     with db(True) as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
+        if external_source(c,eid): fail(409,'Сценарии для Яндекс Форм пока недоступны')
         n=len(questions(e))
         if len(set(v.order))!=len(v.order) or any(not 0<=i<n for i in v.order): fail(422,'Неверный порядок вопросов')
         if any(s.question>=n or (s.mode.startswith('analysis') and n<2) for s in v.slides): fail(422,'Неверный слайд')
@@ -1018,6 +1019,7 @@ def yf_status():
 @app.put('/api/admin/yandex',dependencies=[Depends(admin)])
 def yf_connect(v:YandexCredentials):
     yf_call(yf.request,v.org,v.token,'/v1/users/me/')
+    yf_call(yf.list_forms,v.org,v.token,'',0)
     with access_db(True) as c:
         c.execute('INSERT OR REPLACE INTO yandex_credentials VALUES(1,?,?,?)',(v.org,v.token,uuid4().hex))
     return {'ok':True}
@@ -1025,7 +1027,7 @@ def yf_connect(v:YandexCredentials):
 @app.delete('/api/admin/yandex',dependencies=[Depends(admin)])
 def yf_disconnect():
     with access_db(True) as c:c.execute('DELETE FROM yandex_credentials')
-    with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,error='Подключение отключено'")
+    with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,revision=?,error='Подключение отключено'",(uuid4().hex,))
     return {'ok':True}
 
 @app.get('/api/admin/yandex/forms',dependencies=[Depends(admin)])
@@ -1072,9 +1074,9 @@ def yf_sync(eid):
             error=''
         except yf.FormsError as exc:ag=None;error=str(exc)
         except Exception:ag=None;error='Неожиданный формат данных Яндекс Форм'
-        current=yf_credentials()
-        if (current or {}).get('revision')!=(creds or {}).get('revision'):return False
         with db(True) as c:
+            current=yf_credentials()
+            if (current or {}).get('revision')!=(creds or {}).get('revision'):return False
             if ag is None:
                 c.execute('UPDATE yandex_source SET error=? WHERE event_id=? AND revision=?',(error,eid,row['revision']))
             else:

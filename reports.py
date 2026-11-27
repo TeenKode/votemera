@@ -24,7 +24,7 @@ def make_report(title,questions,rounds,fmt):
         for col,width in zip('ABCDEFG',[30,24,60,32,12,12,12]): ws.column_dimensions[col].width=width
         for i,q in enumerate(questions):
             sheet=wb.create_sheet(f'Вопрос {i+1}')
-            sheet.append([safe_cell(q['question'])])
+            sheet.append([safe_cell(q['question']+(' — множественный выбор, доля ответивших' if q.get('multi') else ''))])
             sheet.append(['Вариант']+[safe_cell(name) for name,_ in rounds])
             for j,o in enumerate(q['options']):
                 sheet.append([safe_cell(o['label'])]+[rs[i]['counts'][j]/rs[i]['total'] if rs[i]['total'] else 0 for _,rs in rounds])
@@ -50,6 +50,7 @@ def make_report(title,questions,rounds,fmt):
     story=[p(title,'title'),p('Анонимные агрегированные результаты'),Spacer(1,12)]
     for i,q in enumerate(questions):
         story.extend([p(f'{i+1}. {q["question"]}','head'),Spacer(1,6)])
+        if q.get('multi'):story.append(p('Множественный выбор: доля ответивших, сумма может превышать 100%.'))
         for name,rs in rounds:
             res=rs[i];story.append(p(f'{name} — ответили: {res["total"]}'))
             table=[[p('Вариант'),p('Голоса'),p('Доля'),p('')]]

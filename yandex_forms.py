@@ -41,11 +41,11 @@ def questions(org,token,sid):
     for page in data.get('pages',[]):
         for q in page.get('items',[]):
             if not isinstance(q,dict) or q.get('hidden'):continue
-            kind=q.get('type'); widget=q.get('widget',kind)
-            items=q.get('items',[])
+            kind=q.get('type'); widget=q.get('widget','radio')
+            items=q.get('items') or []
             labels=[str(x.get('label','')) for x in items if isinstance(x,dict)]
             if kind=='boolean': labels=['Да','Нет']
-            supported=kind=='boolean' or (kind in ('enum','radio','checkbox','dropdown','stars','onerow') and 2<=len(labels)<=6 and len(set(labels))==len(labels) and all(0<len(x)<=80 and x.strip() for x in labels))
+            supported=kind=='boolean' or (kind=='enum' and not q.get('data_source') and not q.get('modify_choices') and 2<=len(labels)<=6 and len(set(labels))==len(labels) and all(0<len(x)<=80 and x.strip() for x in labels))
             result.append({'id':int(q['id']),'label':str(q.get('label') or 'Вопрос')[:300],'kind':kind,'multi':widget=='checkbox' and not any(v.get('type')=='single' for v in q.get('validators',[]) if isinstance(v,dict)),'supported':supported,'options':[{'label':x,'color':COLORS[i]} for i,x in enumerate(labels)] if supported else []})
     return result
 def validate_date(value):
@@ -96,6 +96,9 @@ def aggregate(org,token,sid,spec,date_from='',date_to=''):
         nxt=(data.get('next') or {}).get('next_url')
         if not nxt:return {'total':len(seen),'results':counts}
         u=urlsplit(nxt)
-        if u.scheme or u.netloc or u.fragment or u.path!=path.split('?')[0] or nxt in pages:raise FormsError('Некорректная ссылка следующей страницы')
+        expected='/v1/surveys/'+form_id(sid)+'/answers'
+        if u.scheme or u.netloc or u.fragment or u.path not in (expected,expected.removeprefix('/v1')):raise FormsError('Некорректная ссылка следующей страницы')
+        nxt=expected+('?' + u.query if u.query else '')
+        if nxt in pages:raise FormsError('Повтор страницы ответов')
         pages.add(nxt);path=nxt
     raise FormsError('Более 20 000 ответов: сузьте период')
