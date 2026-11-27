@@ -15,7 +15,8 @@ import time
 import subprocess
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext, closing
+from contextlib import asynccontextmanager, contextmanager, nullcontext, closing
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -364,9 +365,11 @@ def meta(c,eid):
 def deadline(c):
     return c.execute('SELECT deadline FROM runtime_config WHERE id=1').fetchone()[0]
 
+def effective_open_for(s, end, *, now=None):
+    return bool(s['opened'] and (end is None or end > (time.time() if now is None else now)))
+
 def effective_open(c,s):
-    end=deadline(c)
-    return bool(s['opened'] and (end is None or end>time.time()))
+    return effective_open_for(s, deadline(c))
 
 def terminal_allowed(c,tid,eid):
     t=c.execute('SELECT locked,event_id FROM terminal_config WHERE id=?',(tid,)).fetchone()
@@ -377,7 +380,8 @@ def snapshot(c, private=False, voting=False):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
     cfg=DEFAULTS | json.loads(s['data'])
     e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
-    result=dict(settings=cfg, event=None, round=s['active_round'], opened=effective_open(c,s), deadline=deadline(c), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
+    end=deadline(c)
+    result=dict(settings=cfg, event=None, round=s['active_round'], opened=effective_open_for(s,end), deadline=end, epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
     if e:
         qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs); m=meta(c,e['id']); ext=external_source(c,e['id'])
         if ext: result['external']=dict(provider='yandex',url='https://forms.yandex.ru/cloud/u/'+ext['form_id']+'/',last_sync=ext['last_sync'],stale=bool(ext['error']) or not ext['enabled'],enabled=bool(ext['enabled'])); result['opened']=False
@@ -404,7 +408,17 @@ def snapshot(c, private=False, voting=False):
             if ext: item.update(source='yandex',total=json.loads(ext['aggregate'])['total'])
     return result
 
-app=FastAPI(title='Votemera',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None)
+@asynccontextmanager
+async def lifespan(_app):
+    stop = threading.Event()
+    worker = threading.Thread(target=yf_worker, args=(stop,), daemon=True, name='yandex-forms')
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+app=FastAPI(title='Votemera',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.middleware('http')
 async def headers(request, call_next):
@@ -654,22 +668,41 @@ def delete_event(eid:int,confirm_results:bool=False):
 def copy_event(eid:int):
     return clone_event(eid,'Копия: ')
 
+def apply_control(c, s, eid, rid, opened, display, duration):
+    stage_changed = (eid, rid) != (s['active_event'], s['active_round'])
+    change_voting = stage_changed or opened is not None or duration is not None
+    end = deadline(c)
+    now = time.time()
+    was_open = effective_open_for(s, end, now=now)
+    if opened is None:
+        opened = was_open
+
+    if not c.execute('SELECT 1 FROM events WHERE id=?', (eid,)).fetchone():
+        fail(404, 'Мероприятие не найдено')
+    if meta(c, eid)['archived']:
+        fail(409, 'Сначала восстановите мероприятие из архива')
+    if external_source(c, eid) and (opened or display not in ('live', 'hidden')):
+        fail(409, 'Для Яндекс Форм используйте текущие результаты или скрытие; сбор ответов управляется в Яндексе')
+    if change_voting and opened and update_busy():
+        fail(409, 'Дождитесь завершения обновления')
+    if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?', (rid, eid)).fetchone():
+        fail(422, 'Неверный этап')
+
+    changed = stage_changed or opened != was_open
+    epoch = uuid4().hex if changed else s['epoch']
+    if change_voting and (not opened or changed or duration is not None):
+        c.execute('UPDATE runtime_config SET deadline=? WHERE id=1', (now + duration if opened and duration else None,))
+    if changed or s['display'] != display or duration is not None:
+        audit(c, 'Управление этапом', f'Мероприятие {eid}, этап {rid}, открыто={opened}, экран={display}')
+    c.execute('UPDATE settings SET active_event=?,active_round=?,opened=?,epoch=?,display=? WHERE id=1',
+              (eid, rid, int(opened) if change_voting else s['opened'], epoch, display))
+    return snapshot(c, private=True)
+
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
     with db(True) as c:
-        if not c.execute('SELECT 1 FROM events WHERE id=?',(v.event,)).fetchone(): fail(404,'Мероприятие не найдено')
-        if meta(c,v.event)['archived']: fail(409,'Сначала восстановите мероприятие из архива')
-        if external_source(c,v.event) and (v.opened or v.display not in ('live','hidden')): fail(409,'Для Яндекс Форм используйте текущие результаты или скрытие; сбор ответов управляется в Яндексе')
-        if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
-        if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
-        s=c.execute('SELECT * FROM settings').fetchone()
-        changed=(s['active_event'],s['active_round'],effective_open(c,s))!=(v.event,v.round,v.opened)
-        epoch=uuid4().hex if changed else s['epoch']
-        if not v.opened or changed or v.duration is not None:
-            c.execute('UPDATE runtime_config SET deadline=? WHERE id=1',(time.time()+v.duration if v.opened and v.duration else None,))
-        if changed or s['display']!=v.display or v.duration is not None: audit(c,'Управление этапом',f'Мероприятие {v.event}, этап {v.round}, открыто={v.opened}, экран={v.display}')
-        c.execute('UPDATE settings SET active_event=?,active_round=?,opened=?,epoch=?,display=? WHERE id=1',(v.event,v.round,int(v.opened),epoch,v.display))
-        return snapshot(c,private=True)
+        s = c.execute('SELECT * FROM settings WHERE id=1').fetchone()
+        return apply_control(c, s, v.event, v.round, v.opened, v.display, v.duration)
 @app.put('/api/admin/analysis/{eid}',dependencies=[Depends(admin)])
 def set_analysis(eid:int,v:AnalysisConfig):
     with db(True) as c:
@@ -687,8 +720,10 @@ def set_presentation(eid:int,v:Presentation):
         if not e: fail(404,'Мероприятие не найдено')
         if external_source(c,eid) and v.slides: fail(409,'Сценарии для Яндекс Форм пока недоступны')
         n=len(questions(e))
-        if len(set(v.order))!=len(v.order) or any(not 0<=i<n for i in v.order): fail(422,'Неверный порядок вопросов')
+        order=set(v.order)
+        if len(order)!=len(v.order) or any(not 0<=i<n for i in order): fail(422,'Неверный порядок вопросов')
         if any(s.question>=n or (s.mode.startswith('analysis') and n<2) for s in v.slides): fail(422,'Неверный слайд')
+        if order and any(s.question>=0 and s.question not in order for s in v.slides): fail(422,'Слайд ссылается на скрытый вопрос')
         c.execute('INSERT INTO presentation_config VALUES(?,?) ON CONFLICT(event_id) DO UPDATE SET data=excluded.data',(eid,json.dumps(v.model_dump())))
     return {'ok':True}
 
@@ -920,13 +955,11 @@ def configure_terminal(tid:str,v:TerminalConfig):
 
 @app.patch('/api/admin/live',dependencies=[Depends(admin)])
 def live_control(v:LiveControl):
-    # Serialize read/modify/write with normal stage control.
-    with WRITE_LOCK:
-        with db() as c:
-            s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
-            opened=effective_open(c,s) if v.opened is None else v.opened
-            target_round=s['active_round'] if v.round is None else v.round
-        return control(Control(event=s['active_event'],round=target_round,opened=opened,display=v.display if v.display is not None else s['display'],duration=v.duration))
+    with db(True) as c:
+        s = c.execute('SELECT * FROM settings WHERE id=1').fetchone()
+        rid = s['active_round'] if v.round is None else v.round
+        display = s['display'] if v.display is None else v.display
+        return apply_control(c, s, s['active_event'], rid, v.opened, display, v.duration)
 
 @app.get('/api/admin/audit',dependencies=[Depends(admin)])
 def audit_history():
@@ -945,9 +978,6 @@ def diagnostics():
     except (OSError,ValueError): pass
     with TERMINALS_LOCK: display_count=sum(now>time.monotonic()-25 for now in DISPLAYS.values())
     return {'displays':display_count,'backup':backup_status,'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
-
-def effective_open_for(s,end):
-    return bool(s['opened'] and (end is None or end>time.time()))
 
 @app.get('/api/admin/qr',dependencies=[Depends(admin)])
 def terminal_qr(url:str):
@@ -975,8 +1005,9 @@ def report(eid:int,fmt:Literal['pdf','xlsx']):
 # Yandex Forms integration, read-only remote access and aggregate-only storage.
 import yandex_forms as yf
 YF_LOCK=threading.Lock()
+YF_QUEUE_LOCK=threading.Lock()
 YF_DUE={}
-YF_STOP=threading.Event()
+YF_MANUAL=set()
 
 class YandexCredentials(BaseModel):
     org: str
@@ -1011,6 +1042,15 @@ def yf_call(fn,*args):
     except yf.FormsError as exc: fail(502,str(exc))
     except (KeyError,TypeError,ValueError):fail(502,'Неожиданный формат ответа Яндекс Форм')
 
+def yf_period(start, end):
+    try:
+        start, end = yf.validate_date(start), yf.validate_date(end)
+    except yf.FormsError as exc:
+        fail(422, str(exc))
+    if start and end and datetime.fromisoformat(start) > datetime.fromisoformat(end):
+        fail(422, 'Начало периода позже окончания')
+    return start, end
+
 @app.get('/api/admin/yandex',dependencies=[Depends(admin)])
 def yf_status():
     creds=yf_credentials()
@@ -1027,14 +1067,15 @@ def yf_connect(v:YandexCredentials):
     if not 8<=len(token)<=2048 or not re.fullmatch(r'[!-~]+',token):fail(422,'Введите действительный OAuth-токен без пробелов')
     yf_call(yf.request,org,token,'/v1/users/me/')
     yf_call(yf.list_forms,org,token,'',0)
-    with access_db(True) as c:
+    with WRITE_LOCK, access_db(True) as c:
         c.execute('INSERT OR REPLACE INTO yandex_credentials VALUES(1,?,?,?)',(org,token,uuid4().hex))
     return {'ok':True}
 
 @app.delete('/api/admin/yandex',dependencies=[Depends(admin)])
 def yf_disconnect():
-    with access_db(True) as c:c.execute('DELETE FROM yandex_credentials')
-    with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,revision=?,error='Подключение отключено'",(uuid4().hex,))
+    with WRITE_LOCK:
+        with access_db(True) as c:c.execute('DELETE FROM yandex_credentials')
+        with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,revision=?,error='Подключение отключено'",(uuid4().hex,))
     return {'ok':True}
 
 @app.get('/api/admin/yandex/forms',dependencies=[Depends(admin)])
@@ -1051,8 +1092,7 @@ def yf_questions(sid:str):
 @app.post('/api/admin/yandex/events',dependencies=[Depends(admin)])
 def yf_create(v:YandexCreate):
     creds=yf_require()
-    start=yf_call(yf.validate_date,v.date_from);end=yf_call(yf.validate_date,v.date_to)
-    if start and end and yf.datetime.fromisoformat(start)>yf.datetime.fromisoformat(end): fail(422,'Начало периода позже окончания')
+    start,end=yf_period(v.date_from,v.date_to)
     available={q['id']:q for q in yf_call(yf.questions,creds['org'],creds['token'],v.form_id)}
     if len(set(v.questions))!=len(v.questions) or any(q not in available or not available[q]['supported'] for q in v.questions):fail(422,'Выберите поддерживаемые вопросы')
     spec=[available[q] for q in v.questions]
@@ -1061,51 +1101,66 @@ def yf_create(v:YandexCreate):
     yf_call(yf.request,creds['org'],creds['token'],'/v1/surveys/'+v.form_id.lower()+'/answers',{'page_size':1,'questions':','.join(str(q) for q in v.questions)})
     ag={'total':0,'results':[{'total':0,'counts':[0]*len(q['options'])} for q in qs]}
     with db(True) as c:
+        if (yf_credentials() or {}).get('revision') != creds['revision']:
+            fail(409, 'Подключение изменилось. Повторите создание мероприятия.')
         eid=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(clean(v.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),time.time(),json.dumps(qs,ensure_ascii=False))).lastrowid
         rid=c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,0)',(eid,'Ответы Яндекс Форм')).lastrowid
         c.execute('INSERT INTO yandex_source VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(eid,creds['org'],v.form_id.lower(),json.dumps(spec,ensure_ascii=False),start,end,v.interval,uuid4().hex,json.dumps(ag),None,'',1))
         audit(c,'Подключение Яндекс Формы',eid)
     return {'id':eid,'round':rid}
 
-def yf_sync(eid):
-    if not YF_LOCK.acquire(blocking=False):return False
-    try:
+def yf_sync(eid, *, automatic_revision=None):
+    with YF_LOCK:
         with db() as c:
-            r=external_source(c,eid)
-            if not r:return False
-            row=dict(r)
-        creds=yf_credentials()
+            row = external_source(c, eid)
+            if not row:
+                return False
+            if automatic_revision is not None:
+                active = c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]
+                if eid != active or not row['enabled'] or row['revision'] != automatic_revision:
+                    return False
+        creds = yf_credentials()
+        error = ''
         try:
-            if not creds or creds['org']!=row['org']:raise yf.FormsError('Нет подключения к организации формы')
-            ag=yf.aggregate(creds['org'],creds['token'],row['form_id'],json.loads(row['spec']),row['date_from'],row['date_to'])
-            error=''
-        except yf.FormsError as exc:ag=None;error=str(exc)
-        except Exception:ag=None;error='Неожиданный формат данных Яндекс Форм'
+            if not creds or creds['org'] != row['org']:
+                raise yf.FormsError('Нет подключения к организации формы')
+            aggregate = yf.aggregate(creds['org'], creds['token'], row['form_id'], json.loads(row['spec']),
+                                     row['date_from'], row['date_to'])
+        except yf.FormsError as exc:
+            aggregate = None
+            error = str(exc)
+        except Exception:
+            aggregate = None
+            error = 'Неожиданный формат данных Яндекс Форм'
         with db(True) as c:
-            current=yf_credentials()
-            if (current or {}).get('revision')!=(creds or {}).get('revision'):return False
-            if ag is None:
-                c.execute('UPDATE yandex_source SET error=? WHERE event_id=? AND revision=?',(error,eid,row['revision']))
+            current = yf_credentials()
+            if (current or {}).get('revision') != (creds or {}).get('revision'):
+                return False
+            if aggregate is None:
+                updated = c.execute('UPDATE yandex_source SET error=? WHERE event_id=? AND revision=?',
+                                    (error, eid, row['revision']))
             else:
-                c.execute('UPDATE yandex_source SET aggregate=?,last_sync=?,error="" WHERE event_id=? AND revision=?',(json.dumps(ag),time.time(),eid,row['revision']))
-        YF_DUE[(str(DB),eid)]=time.monotonic()+max(row['interval'],60 if error else 0)
-        return ag is not None
-    finally:YF_LOCK.release()
+                updated = c.execute('UPDATE yandex_source SET aggregate=?,last_sync=?,error="" WHERE event_id=? AND revision=?',
+                                    (json.dumps(aggregate), time.time(), eid, row['revision']))
+            if not updated.rowcount:
+                return False
+        delay = max(row['interval'], 60) if aggregate is None else row['interval']
+        with YF_QUEUE_LOCK:
+            YF_DUE[(str(DB), eid)] = (row['revision'], time.monotonic() + delay)
+        return aggregate is not None
 
 @app.put('/api/admin/yandex/events/{eid}',dependencies=[Depends(admin)])
 def yf_settings(eid:int,v:YandexSettings):
     with db(True) as c:
         row=external_source(c,eid)
         if not row:fail(404,'Подключение не найдено')
-        start=row['date_from'] if v.date_from is None else yf_call(yf.validate_date,v.date_from)
-        end=row['date_to'] if v.date_to is None else yf_call(yf.validate_date,v.date_to)
-        if start and end and yf.datetime.fromisoformat(start)>yf.datetime.fromisoformat(end):fail(422,'Начало периода позже окончания')
+        start,end=yf_period(row['date_from'] if v.date_from is None else v.date_from,
+                            row['date_to'] if v.date_to is None else v.date_to)
         if (start,end)!=(row['date_from'],row['date_to']):
             # Never present statistics from the old period as statistics for the new period.
             empty={'total':0,'results':[{'total':0,'counts':[0]*len(q['options'])} for q in json.loads(row['spec'])]}
             c.execute('UPDATE yandex_source SET aggregate=?,last_sync=NULL,error=? WHERE event_id=?',(json.dumps(empty),'Период изменён; требуется синхронизация',eid))
         c.execute('UPDATE yandex_source SET interval=?,enabled=?,revision=?,date_from=?,date_to=? WHERE event_id=?',(v.interval,int(v.enabled),uuid4().hex,start,end,eid))
-    YF_DUE[(str(DB),eid)]=0
     return {'ok':True}
 
 @app.post('/api/admin/yandex/events/{eid}/sync',dependencies=[Depends(admin)])
@@ -1113,35 +1168,39 @@ def yf_manual(eid:int):
     with db() as c:
         if not external_source(c,eid):fail(404,'Подключение не найдено')
     # The worker does network I/O; no long HTTP request or blocked SSE loop.
-    YF_DUE[(str(DB),eid)]=0
     with YF_QUEUE_LOCK: YF_MANUAL.add((str(DB),eid))
     return {'queued':True}
 
-YF_MANUAL=set()
-YF_QUEUE_LOCK=threading.Lock()
-def yf_worker():
-    while not YF_STOP.wait(1):
+def yf_sync_pending(stop):
+    database = str(DB)
+    with db() as c:
+        active = c.execute('''SELECT y.event_id,y.revision FROM yandex_source y
+            JOIN settings s ON s.active_event=y.event_id WHERE s.id=1 AND y.enabled=1''').fetchone()
+    with YF_QUEUE_LOCK:
+        manual = {eid for path, eid in YF_MANUAL if path == database}
+        if len(YF_DUE) > 1000:
+            YF_DUE.clear()
+        candidates = [(eid, None) for eid in sorted(manual)]
+        if active and active['event_id'] not in manual:
+            key = (database, active['event_id'])
+            revision, due = YF_DUE.get(key, (None, 0))
+            if revision != active['revision'] or time.monotonic() >= due:
+                candidates.append((active['event_id'], active['revision']))
+
+    for eid, revision in candidates:
+        if stop.is_set():
+            return
+        if revision is None:
+            with YF_QUEUE_LOCK:
+                YF_MANUAL.discard((database, eid))
+        yf_sync(eid, automatic_revision=revision)
+
+def yf_worker(stop):
+    while not stop.wait(1):
         try:
-            with db() as c:
-                rows=[dict(r) for r in c.execute('SELECT y.event_id,y.enabled,y.interval FROM yandex_source y JOIN settings s ON s.active_event=y.event_id WHERE s.id=1')]
-            with YF_QUEUE_LOCK: manual=set(YF_MANUAL)
-            candidates={(str(DB),r['event_id']) for r in rows if r['enabled']} | manual
-            for key in candidates:
-                if key[0]!=str(DB) or time.monotonic()<YF_DUE.get(key,0):continue
-                with YF_QUEUE_LOCK: YF_MANUAL.discard(key)
-                yf_sync(key[1])
-            if len(YF_DUE)>1000:YF_DUE.clear()
+            yf_sync_pending(stop)
         except Exception:
-            YF_STOP.wait(5)
-
-@app.on_event('startup')
-def start_yandex_worker():
-    YF_STOP.clear()
-    threading.Thread(target=yf_worker,daemon=True,name='yandex-forms').start()
-
-@app.on_event('shutdown')
-def stop_yandex_worker():
-    YF_STOP.set()
+            stop.wait(5)
 
 @app.get('/api/admin/yandex/events/{eid}/qr',dependencies=[Depends(admin)])
 def yf_qr(eid:int):

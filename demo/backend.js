@@ -19,6 +19,7 @@ const Demo=(()=>{
  function event(d,id=d.active){const e=d.events.find(x=>x.id===Number(id));if(!e)throw [404,'Мероприятие не найдено'];return e}
  function detail(e){return {...e,question:e.questions[0].question,options:e.questions[0].options}}
  function visible(q,choices){return !q.show_if||choices[q.show_if.question]===q.show_if.choice}
+ function votingOpen(d,now=Date.now()/1000){return d.opened&&(d.deadline==null||d.deadline>now)}
  function results(d,e,r){
   const rows=d.ballots.filter(b=>b.round===r.id),results=e.questions.map((q,i)=>{const counts=q.options.map((_,j)=>rows.filter(b=>b.choices[i]===j).length);return {counts,total:counts.reduce((a,b)=>a+b,0)}});
   const item={...r,total:rows.length,counts:results[0].counts,results};
@@ -29,7 +30,7 @@ const Demo=(()=>{
   const e=event(d),rounds=e.rounds.map(r=>{const include=priv||(!vote&&d.display!=='hidden'&&(['compare','analysis_compare','presentation'].includes(d.display)||r.id===d.round));return include?results(d,e,r):{...r}});
   const item={...detail(e),rounds};
   if(vote){delete item.analysis;delete item.presentation}else if(!priv&&!['analysis','analysis_compare','presentation'].includes(d.display))delete item.analysis;
-  const s={settings:{...d.settings,...(priv?{}:{...(e.meta?.brand?{brand:e.meta.brand}:{}),...(e.meta?.accent?{accent:e.meta.accent}:{})})},event:item,round:d.round,opened:d.opened&&(!d.deadline||d.deadline>Date.now()/1000),deadline:d.deadline||null,logo:e.meta?.logo||'',epoch:d.epoch,display:d.display,version:VERSION,terminal_key_required:false};
+  const s={settings:{...d.settings,...(priv?{}:{...(e.meta?.brand?{brand:e.meta.brand}:{}),...(e.meta?.accent?{accent:e.meta.accent}:{})})},event:item,round:d.round,opened:votingOpen(d),deadline:d.deadline??null,logo:e.meta?.logo||'',epoch:d.epoch,display:d.display,version:VERSION,terminal_key_required:false};
   if(priv)s.events=d.events.map(e=>({id:e.id,title:e.title,question:e.questions[0].question,created:e.created,round_count:e.rounds.length,archived:e.meta?.archived||false,template:e.meta?.template||false,total:d.ballots.filter(b=>e.rounds.some(r=>r.id===b.round)).length})).reverse();return s;
  }
  const json=(v,status=200)=>new Response(JSON.stringify(v),{status,headers:{'Content-Type':'application/json'}});
@@ -44,16 +45,39 @@ const Demo=(()=>{
   if(p==='/api/admin/state')return json(snapshot(d,true));
   if(p==='/api/admin/terminals') {const now=Date.now(),terminals=Object.entries(d.terminals).filter(([,t])=>now-t<300000).map(([id,t])=>({id:id.slice(-8),seconds_ago:Math.floor((now-t)/1000),online:now-t<25000,key_name:'Демо'}));return json({online:terminals.filter(t=>t.online).length,terminals})}
   if(p==='/api/terminal/heartbeat'){d.terminals[v.terminal]=Date.now();save(d);return ok()}
-  if(p==='/api/ballot'){const e=event(d);if(d.ballots.some(b=>b.nonce===v.nonce))return json({ok:true,duplicate:true});if(!d.opened||(d.deadline&&d.deadline<=Date.now()/1000)||d.round!==v.round||d.epoch!==v.epoch)error(409,'Этап изменился');if(v.choices.length!==e.questions.length||e.questions.some((q,i)=>visible(q,v.choices)?!Number.isInteger(v.choices[i])||v.choices[i]<0||v.choices[i]>=q.options.length:v.choices[i]!==null))error(422,'Неверные ответы');d.ballots.push({...v,created:Date.now()});save(d);return ok()}
-  if(p==='/api/admin/live'){v={event:d.active,round:v.round??d.round,opened:v.opened??(d.opened&&(!d.deadline||d.deadline>Date.now()/1000)),display:v.display??d.display,...v};return dispatch('/api/admin/control','POST',v)}
-  if(p==='/api/admin/control'){const e=event(d,v.event);if(e.meta?.archived)error(409,'Мероприятие в архиве');if(!e.rounds.some(r=>r.id===v.round))error(422,'Неверный этап');if(d.active!==v.event||d.round!==v.round||d.opened!==v.opened||(d.deadline&&d.deadline<=Date.now()/1000&&v.opened)){d.epoch=uid();d.deadline=null}if(!v.opened||v.duration!==undefined)d.deadline=v.opened&&v.duration?Date.now()/1000+v.duration:null;Object.assign(d,{active:v.event,round:v.round,opened:v.opened,display:v.display});save(d);return json(snapshot(d,true))}
+  if(p==='/api/ballot'){const e=event(d);if(d.ballots.some(b=>b.nonce===v.nonce))return json({ok:true,duplicate:true});if(!votingOpen(d)||d.round!==v.round||d.epoch!==v.epoch)error(409,'Этап изменился');if(v.choices.length!==e.questions.length||e.questions.some((q,i)=>visible(q,v.choices)?!Number.isInteger(v.choices[i])||v.choices[i]<0||v.choices[i]>=q.options.length:v.choices[i]!==null))error(422,'Неверные ответы');d.ballots.push({...v,created:Date.now()});save(d);return ok()}
+  if(p==='/api/admin/live'){
+   const display=v.display??d.display;
+   if(v.opened==null&&v.round==null&&v.duration==null){d.display=display;save(d);return json(snapshot(d,true))}
+   return dispatch('/api/admin/control','POST',{event:d.active,round:v.round??d.round,opened:v.opened,display,duration:v.duration});
+  }
+  if(p==='/api/admin/control'){
+   const e=event(d,v.event);
+   if(e.meta?.archived)error(409,'Мероприятие в архиве');
+   if(!e.rounds.some(r=>r.id===v.round))error(422,'Неверный этап');
+   const now=Date.now()/1000,wasOpen=votingOpen(d,now),opened=v.opened??wasOpen;
+   const changed=d.active!==v.event||d.round!==v.round||wasOpen!==opened;
+   if(changed)d.epoch=uid();
+   if(changed||!opened||v.duration!=null)d.deadline=opened&&v.duration?now+v.duration:null;
+   Object.assign(d,{active:v.event,round:v.round,opened,display:v.display});
+   save(d);return json(snapshot(d,true));
+  }
   if(p==='/api/admin/settings'){d.settings={...defaults,...v};save(d);return ok()}
   if(p==='/api/admin/event'&&method==='POST'){const e=newEvent(d,v);save(d);return json({id:e.id,round:e.rounds[0].id})}
   if((m=p.match(/^\/api\/admin\/event\/(\d+)\/meta$/))){const e=event(d,m[1]);if(v.archived&&e.id===d.active)error(409,'Сначала выберите другое мероприятие');e.meta={...v};save(d);return ok()}
-  if((m=p.match(/^\/api\/admin\/event\/(\d+)$/))){const e=event(d,m[1]);if(method==='GET')return json(detail(e));if(method==='DELETE'){if(e.id===d.active)error(409,'Сначала выберите другое мероприятие');if(d.ballots.some(b=>e.rounds.some(r=>r.id===b.round))&&u.searchParams.get('confirm_results')!=='true')error(409,'Подтвердите удаление результатов');d.ballots=d.ballots.filter(b=>!e.rounds.some(r=>r.id===b.round));d.events=d.events.filter(x=>x.id!==e.id);save(d);return ok()}if(method==='PUT'){validate(v);if((d.active===e.id&&d.opened)||d.ballots.some(b=>e.rounds.some(r=>r.id===b.round)))error(409,'Сначала закройте голосование и очистите результаты');e.title=v.title;e.questions=v.questions;e.rounds=v.rounds.map(name=>({id:d.nextRound++,name}));e.analysis=v.questions.length>1?{first:0,second:1,chart:'stack'}:null;e.presentation={order:v.questions.map((_,i)=>i),slides:[],seconds:15};if(d.active===e.id){d.round=e.rounds[0].id;d.epoch=uid()}save(d);return json({id:e.id,round:e.rounds[0].id})}}
+  if((m=p.match(/^\/api\/admin\/event\/(\d+)$/))){const e=event(d,m[1]);if(method==='GET')return json(detail(e));if(method==='DELETE'){if(e.id===d.active)error(409,'Сначала выберите другое мероприятие');if(d.ballots.some(b=>e.rounds.some(r=>r.id===b.round))&&u.searchParams.get('confirm_results')!=='true')error(409,'Подтвердите удаление результатов');d.ballots=d.ballots.filter(b=>!e.rounds.some(r=>r.id===b.round));d.events=d.events.filter(x=>x.id!==e.id);save(d);return ok()}if(method==='PUT'){validate(v);if((d.active===e.id&&votingOpen(d))||d.ballots.some(b=>e.rounds.some(r=>r.id===b.round)))error(409,'Сначала закройте голосование и очистите результаты');e.title=v.title;e.questions=v.questions;e.rounds=v.rounds.map(name=>({id:d.nextRound++,name}));e.analysis=v.questions.length>1?{first:0,second:1,chart:'stack'}:null;e.presentation={order:v.questions.map((_,i)=>i),slides:[],seconds:15};if(d.active===e.id){d.round=e.rounds[0].id;d.epoch=uid()}save(d);return json({id:e.id,round:e.rounds[0].id})}}
   if((m=p.match(/^\/api\/admin\/(?:event\/(\d+)\/copy|rehearsal\/(\d+))$/))){const old=event(d,m[1]||m[2]),e=newEvent(d,{title:(m[1]?'Копия: ':'[Репетиция] ')+old.title,questions:structuredClone(old.questions),rounds:old.rounds.map(r=>r.name)});e.analysis=structuredClone(old.analysis);e.presentation=structuredClone(old.presentation);if(old.meta)e.meta={...structuredClone(old.meta),template:false,archived:false};save(d);return json({id:e.id,round:e.rounds[0].id})}
-  if((m=p.match(/^\/api\/admin\/(analysis|presentation)\/(\d+)$/))){const e=event(d,m[2]);if(m[1]==='analysis'&&(v.first===v.second||!e.questions[v.first]||!e.questions[v.second]))error(422,'Выберите два разных вопроса');if(m[1]==='presentation'&&(v.order.some(i=>!e.questions[i])||new Set(v.order).size!==v.order.length))error(422,'Неверный порядок вопросов');e[m[1]]=v;save(d);return ok()}
-  if((m=p.match(/^\/api\/admin\/round\/(\d+)\/votes$/))){const id=+m[1];if(d.opened&&d.round===id)error(409,'Сначала закройте этап');d.ballots=d.ballots.filter(b=>b.round!==id);if(d.round===id)d.epoch=uid();save(d);return ok()}
+  if((m=p.match(/^\/api\/admin\/(analysis|presentation)\/(\d+)$/))){
+   const e=event(d,m[2]);
+   if(m[1]==='analysis'&&(v.first===v.second||!e.questions[v.first]||!e.questions[v.second]))error(422,'Выберите два разных вопроса');
+   if(m[1]==='presentation'){
+    const order=new Set(v.order);
+    if(v.order.some(i=>!e.questions[i])||order.size!==v.order.length)error(422,'Неверный порядок вопросов');
+    if(order.size&&(v.slides??[]).some(s=>s.question>=0&&!order.has(s.question)))error(422,'Слайд ссылается на скрытый вопрос');
+   }
+   e[m[1]]=v;save(d);return ok();
+  }
+  if((m=p.match(/^\/api\/admin\/round\/(\d+)\/votes$/))){const id=+m[1];if(votingOpen(d)&&d.round===id)error(409,'Сначала закройте этап');d.ballots=d.ballots.filter(b=>b.round!==id);if(d.round===id)d.epoch=uid();save(d);return ok()}
   if((m=p.match(/^\/api\/admin\/(export|cross-export)\/(\d+)$/)))return csv(d,event(d,m[2]),m[1]==='cross-export');
   return json({detail:'В демонстрации эта серверная функция недоступна'},503);
  }

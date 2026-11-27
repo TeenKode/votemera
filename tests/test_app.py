@@ -1,8 +1,10 @@
 import os
 import tempfile
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
@@ -224,8 +226,10 @@ def test_presentation_and_rehearsal(client):
     s=multi(client);eid=s['event']['id']
     send_ballot(client,s,[0,2])
     config=dict(order=[1,0],slides=[{'mode':'compare','question':1},{'mode':'analysis'}],seconds=10)
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={**config,'order':[]}).is_success
     assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json=config).status_code==200
     assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={**config,'order':[1,1]}).status_code==422
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={**config,'order':[0]}).status_code==422
     activate(client,display='presentation')
     public=client.get('/api/state').json()['event']
     assert public['presentation']['order']==[1,0]
@@ -329,6 +333,24 @@ def test_timer_and_live_control(client,monkeypatch):
     assert submit(client,payload(timed)).status_code==409
     reopened=client.patch('/api/admin/live',headers=AUTH,json={'opened':True,'duration':0}).json()
     assert reopened['opened'] and reopened['deadline'] is None and reopened['epoch']!=timed['epoch']
+
+def test_display_change_at_deadline_keeps_voting_closed(client, monkeypatch):
+    timed = client.patch('/api/admin/live', headers=AUTH, json={'opened': True, 'duration': 60}).json()
+    end = timed['deadline']
+    assert timed['opened']
+    times = iter([end - .01, end])
+    clock = SimpleNamespace(time=lambda: next(times, end + 1), monotonic=a.time.monotonic)
+    monkeypatch.setattr(a, 'time', clock)
+
+    response = client.patch('/api/admin/live', headers=AUTH, json={'display': 'hidden'})
+
+    assert response.is_success
+    fresh = client.get('/api/state').json()
+    assert fresh['display'] == 'hidden'
+    assert fresh['opened'] is False
+    assert fresh['deadline'] == end
+    assert fresh['epoch'] == timed['epoch']
+    assert submit(client, payload(timed)).status_code == 409
 
 def test_terminal_controls(client):
     s=activate(client);tid=uuid.uuid4().hex
@@ -436,6 +458,80 @@ def test_yandex_pagination_and_dedup(monkeypatch):
     monkeypatch.setattr(yf,'request',get)
     spec=[{'id':10,'kind':'enum','multi':False,'options':[{'label':'Да'},{'label':'Нет'}]}]
     assert yf.aggregate('123','secret',sid,spec,'2026-01-01T00:00:00+00:00')=={'total':2,'results':[{'total':2,'counts':[1,1]}]}
+
+@pytest.fixture
+def yandex_event(client, monkeypatch):
+    sid = 'a' * 24
+
+    def request(org, token, path, params=None):
+        if path.endswith('/questions'):
+            return {'pages': [{'items': [{'id': 10, 'label': 'Вопрос', 'type': 'boolean'}]}]}
+        if path == '/v1/surveys':
+            return {'result': []}
+        return {}
+
+    monkeypatch.setattr(a.yf, 'request', request)
+    monkeypatch.setattr(a, 'YF_MANUAL', set())
+    monkeypatch.setattr(a, 'YF_DUE', {})
+    assert client.put('/api/admin/yandex', headers=AUTH, json={'org': '123', 'token': 'mock-token'}).is_success
+    response = client.post('/api/admin/yandex/events', headers=AUTH, json={
+        'form_id': sid, 'title': 'Яндекс Формы', 'questions': [10], 'interval': 3600,
+    })
+    assert response.is_success
+    return response.json()
+
+
+def test_yandex_period_change_during_sync(client, monkeypatch, yandex_event):
+    eid = yandex_event['id']
+    path = f'/api/admin/yandex/events/{eid}'
+    control = {'event': eid, 'round': yandex_event['round'], 'opened': False, 'display': 'live'}
+    assert client.post('/api/admin/control', headers=AUTH, json=control).is_success
+    config = {'interval': 3600, 'enabled': True}
+    date = '2026-01-01T00:00:00+00:00'
+    calls = []
+
+    def aggregate(org, token, sid, spec, date_from, date_to):
+        calls.append(date_from)
+        if len(calls) == 2:
+            assert client.put(path, headers=AUTH, json={**config, 'date_from': date}).is_success
+        return {'total': 1, 'results': [{'total': 1, 'counts': [int(bool(date_from)), int(not date_from)]}]}
+
+    monkeypatch.setattr(a.yf, 'aggregate', aggregate)
+    assert a.yf_sync(eid)
+    assert not a.yf_sync(eid)
+    assert client.get('/api/state').json()['event']['rounds'][0]['total'] == 0
+    a.yf_sync_pending(threading.Event())
+    a.yf_sync_pending(threading.Event())
+    assert calls == ['', '', date]
+    assert client.get('/api/state').json()['event']['rounds'][0]['counts'] == [1, 0]
+
+
+def test_yandex_manual_request_during_sync(client, monkeypatch, yandex_event):
+    eid = yandex_event['id']
+    calls = []
+
+    def aggregate(*args):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            assert client.post(f'/api/admin/yandex/events/{eid}/sync', headers=AUTH).is_success
+        return {'total': len(calls), 'results': [{'total': len(calls), 'counts': [len(calls), 0]}]}
+
+    monkeypatch.setattr(a.yf, 'aggregate', aggregate)
+    assert a.yf_sync(eid)
+    a.yf_sync_pending(threading.Event())
+    a.yf_sync_pending(threading.Event())
+    assert calls == [1, 2]
+    assert client.get('/api/admin/yandex', headers=AUTH).json()['sources'][0]['total'] == 2
+
+
+def test_yandex_invalid_period_returns_validation_error(client, yandex_event):
+    eid = yandex_event['id']
+    response = client.put(f'/api/admin/yandex/events/{eid}', headers=AUTH, json={
+        'interval': 5, 'enabled': True, 'date_from': '2026-01-01T09:00:00',
+    })
+    assert response.status_code == 422
+    assert 'часовым поясом' in response.json()['detail']
+
 
 def test_yandex_cloud_org_headers(client,monkeypatch):
     import yandex_forms as yf
