@@ -257,3 +257,19 @@ def test_conditional_questions(client):
     activate(client,display='analysis')
     cross=client.get('/api/state').json()['event']['rounds'][0]['cross']
     assert cross['total']==1 and cross['unpaired']==1
+
+def test_restore_backup(client):
+    s=activate(client)
+    assert submit(client,payload(s)).status_code==200
+    backup=client.get('/api/admin/backup',headers=AUTH).content
+    assert client.post('/api/admin/restore',headers=AUTH,content=backup).status_code==409
+    activate(client,False)
+    assert client.delete(f'/api/admin/round/{s["round"]}/votes',headers=AUTH).status_code==200
+    assert client.post('/api/admin/restore',content=backup).status_code==401
+    assert client.post('/api/admin/restore',headers=AUTH,content=b'invalid').status_code==422
+    assert client.post('/api/admin/restore',headers=AUTH,content=backup).status_code==200
+    fresh=client.get('/api/admin/state',headers=AUTH).json()
+    assert not fresh['opened'] and fresh['display']=='hidden'
+    assert fresh['event']['rounds'][0]['total']==1
+    assert all('counts' not in r for r in client.get('/api/state').json()['event']['rounds'])
+    assert list((a.DB.parent/'restore-backups').glob('*.db'))
