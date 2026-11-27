@@ -993,6 +993,8 @@ class YandexCreate(BaseModel):
 class YandexSettings(BaseModel):
     interval: int=Field(ge=5,le=3600)
     enabled: bool
+    date_from: str | None=Field(default=None,max_length=40)
+    date_to: str | None=Field(default=None,max_length=40)
 
 def yf_credentials():
     with access_db() as c:
@@ -1088,7 +1090,16 @@ def yf_sync(eid):
 @app.put('/api/admin/yandex/events/{eid}',dependencies=[Depends(admin)])
 def yf_settings(eid:int,v:YandexSettings):
     with db(True) as c:
-        if not c.execute('UPDATE yandex_source SET interval=?,enabled=?,revision=? WHERE event_id=?',(v.interval,int(v.enabled),uuid4().hex,eid)).rowcount:fail(404,'Подключение не найдено')
+        row=external_source(c,eid)
+        if not row:fail(404,'Подключение не найдено')
+        start=row['date_from'] if v.date_from is None else yf_call(yf.validate_date,v.date_from)
+        end=row['date_to'] if v.date_to is None else yf_call(yf.validate_date,v.date_to)
+        if start and end and yf.datetime.fromisoformat(start)>yf.datetime.fromisoformat(end):fail(422,'Начало периода позже окончания')
+        if (start,end)!=(row['date_from'],row['date_to']):
+            # Never present statistics from the old period as statistics for the new period.
+            empty={'total':0,'results':[{'total':0,'counts':[0]*len(q['options'])} for q in json.loads(row['spec'])]}
+            c.execute('UPDATE yandex_source SET aggregate=?,last_sync=NULL,error=? WHERE event_id=?',(json.dumps(empty),'Период изменён; требуется синхронизация',eid))
+        c.execute('UPDATE yandex_source SET interval=?,enabled=?,revision=?,date_from=?,date_to=? WHERE event_id=?',(v.interval,int(v.enabled),uuid4().hex,start,end,eid))
     YF_DUE[(str(DB),eid)]=0
     return {'ok':True}
 
