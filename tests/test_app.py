@@ -436,3 +436,33 @@ def test_yandex_pagination_and_dedup(monkeypatch):
     monkeypatch.setattr(yf,'request',get)
     spec=[{'id':10,'kind':'enum','multi':False,'options':[{'label':'Да'},{'label':'Нет'}]}]
     assert yf.aggregate('123','secret',sid,spec,'2026-01-01T00:00:00+00:00')=={'total':2,'results':[{'total':2,'counts':[1,1]}]}
+
+def test_yandex_cloud_org_headers(client,monkeypatch):
+    import yandex_forms as yf
+    import json
+    from contextlib import contextmanager
+    cloud='bpf2c65rqcl8abcdefgh'
+    captured=[]
+    class MockResponse:
+        def read(self,n):return b'{"result":[]}'
+    class MockOpener:
+        @contextmanager
+        def open(self,req,timeout):
+            captured.append(dict(req.header_items()))
+            yield MockResponse()
+    monkeypatch.setattr(yf,'build_opener',lambda *args:MockOpener())
+    for org,header in [('123456','X-org-id'),(cloud,'X-cloud-org-id')]:
+        response=client.put('/api/admin/yandex',headers=AUTH,json={'org':org,'token':'OAuth mock-secret-123'})
+        assert response.is_success,response.text
+        assert client.get('/api/admin/yandex/forms',headers=AUTH).is_success
+        assert client.get('/api/admin/yandex',headers=AUTH).json()['org_header'].lower()==header
+        for request_headers in captured[-3:]:
+            assert request_headers[header.capitalize()]==org
+            assert request_headers['Authorization']=='OAuth mock-secret-123'
+            assert ('X-cloud-org-id' if header=='X-org-id' else 'X-org-id').capitalize() not in request_headers
+    before=len(captured)
+    response=client.put('/api/admin/yandex',headers=AUTH,json={'org':'X-Cloud-Org-Id: '+cloud,'token':'mock-secret-123'})
+    assert response.status_code==422 and 'mock-secret-123' not in response.text
+    assert len(captured)==before
+    assert client.get('/api/admin/yandex',headers=AUTH).json()['org']==cloud
+    assert client.put('/api/admin/yandex',headers=AUTH,json={'org':cloud,'token':'invalid token'}).status_code==422

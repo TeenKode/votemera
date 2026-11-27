@@ -12,7 +12,7 @@ import yandex_forms as yf
 import app,uvicorn
 SID='a'*24
 def request(org,token,path,params=None):
-    if org!='123456' or token!='mock-token-123':raise yf.FormsError('Нет доступа')
+    if org!='bpf2c65rqcl8abcdefgh' or token!='mock-token-123':raise yf.FormsError('Нет доступа')
     if path=='/v1/users/me/':return {'id':1}
     if path=='/v1/surveys':return {'result':[{'id':SID,'name':'Тестовая форма','is_published':True}]}
     if path.endswith('/questions'):return {'pages':[{'items':[{'id':10,'label':'Используете ИИ?','type':'enum','widget':'checkbox','items':[{'label':'Да'},{'label':'Нет'}]},{'id':11,'label':'ФИО','type':'string'}]}]}
@@ -39,10 +39,11 @@ with tempfile.TemporaryDirectory() as d:
             a.get_by_label('Пароль администратора').fill('test-secret')
             a.get_by_role('button',name='Войти').click()
             a.get_by_role('button',name='Интеграции',exact=True).click()
-            a.get_by_label('ID организации').fill('123456')
+            a.get_by_label('ID организации').fill('bpf2c65rqcl8abcdefgh')
+            expect(a.get_by_text('Yandex Identity Hub · X-Cloud-Org-Id',exact=True)).to_be_visible()
             a.get_by_label('OAuth-токен').fill('mock-token-123')
             a.get_by_role('button',name='Проверить и подключить').click()
-            expect(a.get_by_text('Подключение сохранено · организация 123456')).to_be_visible()
+            expect(a.get_by_text('Подключение сохранено · организация bpf2c65rqcl8abcdefgh')).to_be_visible()
             expect(a.get_by_label('OAuth-токен')).to_have_value('')
             a.get_by_role('button',name='Загрузить формы').click()
             expect(a.get_by_label('Название импортируемого опроса')).to_have_value('Тестовая форма')

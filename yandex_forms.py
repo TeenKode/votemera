@@ -13,13 +13,19 @@ class NoRedirect(HTTPRedirectHandler):
 def form_id(value):
     if not re.fullmatch(r'[a-fA-F0-9]{24}',value): raise FormsError('Некорректный ID формы')
     return value.lower()
+def organization_header(org):
+    """Yandex 360 uses numeric IDs; Identity Hub uses opaque alphanumeric IDs."""
+    if re.fullmatch(r'[0-9]{1,32}',org):return 'X-Org-Id'
+    if re.fullmatch(r'[A-Za-z0-9_-]{3,64}',org) and re.search(r'[A-Za-z]',org):return 'X-Cloud-Org-Id'
+    raise FormsError('Укажите числовой ID Яндекс 360 или ID Yandex Identity Hub (например, bpf…) без названия заголовка')
+
 def request(org,token,path,params=None):
     if not path.startswith('/v1/'):raise FormsError('Некорректный путь API')
     u=urlsplit(path)
     if u.netloc or u.scheme or u.fragment:raise FormsError('Некорректный путь API')
     url=BASE+path+('?' + urlencode(params) if params else '')
     try:
-        req=Request(url,headers={'Authorization':'OAuth '+token,'X-Org-Id':org,'Accept':'application/json','User-Agent':'Votemera'})
+        req=Request(url,headers={'Authorization':'OAuth '+token,organization_header(org):org,'Accept':'application/json','User-Agent':'Votemera'})
         with build_opener(NoRedirect()).open(req,timeout=12) as res:
             raw=res.read(8*1024*1024+1)
             if len(raw)>8*1024*1024:raise FormsError('Слишком большой ответ API')
@@ -27,7 +33,7 @@ def request(org,token,path,params=None):
             if not isinstance(result,dict):raise FormsError('Некорректный ответ API')
             return result
     except HTTPError as e:
-        messages={401:'OAuth-токен не принят',403:'Нет прав на форму или ответы',404:'Форма не найдена',429:'Лимит запросов Яндекса'}
+        messages={400:'Яндекс отклонил параметры запроса; проверьте ID организации',401:'OAuth-токен не принят или не соответствует организации',403:'Нет прав на форму или ответы',404:'Форма не найдена',422:'Яндекс не принял параметры запроса; проверьте тип и ID организации',429:'Лимит запросов Яндекса'}
         raise FormsError(messages.get(e.code,'Ошибка API Яндекса: HTTP '+str(e.code))) from None
     except (URLError,OSError,ValueError):raise FormsError('Яндекс Формы недоступны или вернули неверный JSON') from None
 def list_forms(org,token,search='',offset=0):

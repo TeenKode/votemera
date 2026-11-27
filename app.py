@@ -979,8 +979,8 @@ YF_DUE={}
 YF_STOP=threading.Event()
 
 class YandexCredentials(BaseModel):
-    org: str=Field(pattern=r'^\d{1,32}$')
-    token: str=Field(min_length=8,max_length=2048,pattern=r'^[!-~]+$')
+    org: str
+    token: str
 
 class YandexCreate(BaseModel):
     form_id: str=Field(pattern=r'^[a-fA-F0-9]{24}$')
@@ -1016,14 +1016,19 @@ def yf_status():
     creds=yf_credentials()
     with db() as c:
         sources=[dict(event_id=r['event_id'],title=r['title'],form_id=r['form_id'],interval=r['interval'],enabled=bool(r['enabled']),last_sync=r['last_sync'],error=r['error'],total=json.loads(r['aggregate'])['total'],date_from=r['date_from'],date_to=r['date_to']) for r in c.execute('SELECT y.*,e.title FROM yandex_source y JOIN events e ON e.id=y.event_id ORDER BY e.id DESC')]
-    return {'connected':bool(creds),'org':creds['org'] if creds else '', 'sources':sources}
+    return {'connected':bool(creds),'org':creds['org'] if creds else '', 'org_header':yf.organization_header(creds['org']) if creds else None, 'sources':sources}
 
 @app.put('/api/admin/yandex',dependencies=[Depends(admin)])
 def yf_connect(v:YandexCredentials):
-    yf_call(yf.request,v.org,v.token,'/v1/users/me/')
-    yf_call(yf.list_forms,v.org,v.token,'',0)
+    org=v.org.strip(); token=v.token.strip()
+    if token.lower().startswith('oauth '):token=token[6:].strip()
+    try: yf.organization_header(org)
+    except yf.FormsError as exc: fail(422,str(exc))
+    if not 8<=len(token)<=2048 or not re.fullmatch(r'[!-~]+',token):fail(422,'Введите действительный OAuth-токен без пробелов')
+    yf_call(yf.request,org,token,'/v1/users/me/')
+    yf_call(yf.list_forms,org,token,'',0)
     with access_db(True) as c:
-        c.execute('INSERT OR REPLACE INTO yandex_credentials VALUES(1,?,?,?)',(v.org,v.token,uuid4().hex))
+        c.execute('INSERT OR REPLACE INTO yandex_credentials VALUES(1,?,?,?)',(org,token,uuid4().hex))
     return {'ok':True}
 
 @app.delete('/api/admin/yandex',dependencies=[Depends(admin)])
