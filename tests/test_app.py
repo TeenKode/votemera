@@ -175,3 +175,31 @@ def test_motion_settings_compatible(client):
         for view in ('vote','display'):
             assert client.get('/api/state',params={'view':view}).json()['settings']['motion']==motion
     assert client.put('/api/admin/settings',headers=AUTH,json={**cfg,'motion':'invalid'}).status_code==422
+
+def test_maintenance_update_and_backup(client,monkeypatch,tmp_path):
+    status=tmp_path/'status'; request=tmp_path/'request'
+    monkeypatch.setattr(a,'UPDATE_STATUS',status);monkeypatch.setattr(a,'UPDATE_REQUEST',request)
+    assert client.post('/api/admin/update',headers=AUTH).status_code==503
+    status.write_text('idle')
+    assert client.post('/api/admin/update').status_code==401
+    activate(client)
+    assert client.post('/api/admin/update',headers=AUTH).status_code==409
+    activate(client,False)
+    assert client.post('/api/admin/update',headers=AUTH).status_code==200
+    assert request.exists()
+    assert client.get('/api/admin/update',headers=AUTH).json()['status']=='queued'
+    assert client.post('/api/admin/update',headers=AUTH).status_code==409
+    s=client.get('/api/admin/state',headers=AUTH).json()
+    assert client.post('/api/admin/control',headers=AUTH,json=dict(event=s['event']['id'],round=s['round'],opened=True,display='live')).status_code==409
+    assert client.get('/api/admin/backup').status_code==401
+    assert client.get('/api/admin/backup',headers=AUTH).content.startswith(b'SQLite format 3')
+def test_cross_export(client):
+    s=multi(client);send_ballot(client,s,[0,2])
+    r=client.get('/api/admin/cross-export/'+str(s['event']['id']),headers=AUTH)
+    assert r.status_code==200 and 'Размер группы' in r.text
+def test_admin_rate_limit(client):
+    a.AUTH_FAILURES.clear()
+    try:
+        for i in range(10): assert client.get('/api/admin/state').status_code==401
+        assert client.get('/api/admin/state').status_code==429
+    finally: a.AUTH_FAILURES.clear()
