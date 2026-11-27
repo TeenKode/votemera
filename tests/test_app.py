@@ -273,3 +273,45 @@ def test_restore_backup(client):
     assert fresh['event']['rounds'][0]['total']==1
     assert all('counts' not in r for r in client.get('/api/state').json()['event']['rounds'])
     assert list((a.DB.parent/'restore-backups').glob('*.db'))
+
+def test_password_and_key_manager(client):
+    assert client.get('/api/admin/keys').status_code==401
+    initial=client.get('/api/admin/keys',headers=AUTH).json()
+    assert initial['required'] and len(initial['keys'])==1 and 'digest' not in initial['keys'][0]
+    assert client.put('/api/admin/password',headers=AUTH,json={'current':'wrong','password':'new-password'}).status_code==403
+    assert client.put('/api/admin/password',headers=AUTH,json={'current':'test-secret','password':'new-password'}).is_success
+    newauth={'Authorization':'Bearer new-password'}
+    assert client.get('/api/admin/state',headers=AUTH).status_code==401
+    assert client.get('/api/admin/state',headers=newauth).is_success
+    a.init()
+    assert client.get('/api/admin/state',headers=newauth).is_success
+    created=client.post('/api/admin/keys',headers=newauth,json={'label':'Зал','key':'my-terminal-key'})
+    assert created.is_success
+    kid=created.json()['id']; hdr={'X-Terminal-Key':'my-terminal-key'}
+    data={'terminal':uuid.uuid4().hex}
+    assert client.post('/api/terminal/heartbeat',headers=hdr,json=data).is_success
+    assert client.post('/api/admin/keys',headers=newauth,json={'label':'Дубликат','key':'my-terminal-key'}).status_code==409
+    assert client.put(f'/api/admin/keys/{kid}',headers=newauth,json={'label':'Зал','enabled':False}).is_success
+    assert client.post('/api/terminal/heartbeat',headers=hdr,json=data).status_code==403
+    assert client.put(f'/api/admin/keys/{kid}',headers=newauth,json={'label':'Зал 2','enabled':True}).is_success
+    assert client.post('/api/terminal/heartbeat',headers=hdr,json=data).is_success
+    rotated=client.post(f'/api/admin/keys/{kid}/rotate',headers=newauth,json={}).json()
+    assert client.post('/api/terminal/heartbeat',headers=hdr,json=data).status_code==403
+    assert client.post('/api/terminal/heartbeat',headers={'X-Terminal-Key':rotated['key']},json=data).is_success
+    assert client.delete(f'/api/admin/keys/{kid}',headers=newauth).is_success
+    assert client.post('/api/terminal/heartbeat',headers={'X-Terminal-Key':rotated['key']},json=data).status_code==403
+    assert client.post('/api/terminal/heartbeat',headers=KEY,json=data).is_success
+
+def test_event_management(client):
+    s=activate(client)
+    eid=s['event']['id']
+    assert submit(client,payload(s)).is_success
+    assert client.delete(f'/api/admin/event/{eid}?confirm_results=true',headers=AUTH).status_code==409
+    clone=client.post(f'/api/admin/event/{eid}/copy',headers=AUTH).json()
+    assert clone['id']!=eid
+    assert client.post('/api/admin/control',headers=AUTH,json=dict(event=clone['id'],round=clone['round'],opened=False,display='hidden')).is_success
+    assert client.delete(f'/api/admin/event/{eid}',headers=AUTH).status_code==409
+    assert client.delete(f'/api/admin/event/{eid}?confirm_results=true',headers=AUTH).is_success
+    assert client.get(f'/api/admin/event/{eid}',headers=AUTH).status_code==404
+    events=client.get('/api/admin/state',headers=AUTH).json()['events']
+    assert len(events)==1 and events[0]['total']==0

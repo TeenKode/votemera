@@ -1,0 +1,45 @@
+"""Admin navigation, event lifecycle and credentials in Chromium."""
+import os
+from playwright.sync_api import sync_playwright,expect
+BASE=os.getenv('BASE_URL','http://127.0.0.1:8765')
+with sync_playwright() as p:
+    b=p.chromium.launch(args=['--no-sandbox'])
+    a=b.new_page(viewport={'width':1366,'height':768})
+    errors=[]
+    a.on('pageerror',lambda e:errors.append(str(e)))
+    a.goto(BASE+'/admin')
+    a.get_by_label('Пароль администратора').fill('test-secret')
+    a.get_by_role('button',name='Войти').click()
+    expect(a.get_by_role('heading',name='Обзор',exact=True)).to_be_visible()
+    a.get_by_role('button',name='Мероприятия',exact=True).click()
+    expect(a.get_by_role('heading',name='Все мероприятия')).to_be_visible()
+    a.get_by_role('button',name='+ Создать мероприятие').click()
+    a.get_by_label('Название мероприятия').fill('Проверка менеджера')
+    a.get_by_label('Текст вопроса').fill('Готовы?')
+    a.get_by_role('button',name='Создать',exact=True).click()
+    row=a.locator('.management-row').filter(has_text='Проверка менеджера')
+    expect(row).to_be_visible()
+    row.get_by_role('button',name='Копировать',exact=True).click()
+    copy=a.locator('.management-row').filter(has_text='Копия: Проверка менеджера')
+    expect(copy).to_be_visible()
+    a.once('dialog',lambda d:d.accept())
+    copy.get_by_role('button',name='Удалить',exact=True).click()
+    expect(copy).to_have_count(0)
+    a.get_by_role('button',name='Терминалы',exact=True).click()
+    a.get_by_label('Название ключа').fill('Зал')
+    a.get_by_label('Свой ключ (пусто — сгенерировать)').fill('custom-key-123')
+    a.get_by_role('button',name='Добавить ключ').click()
+    expect(a.get_by_label('Новый ключ терминала')).to_have_value('custom-key-123')
+    a.get_by_role('button',name='Безопасность',exact=True).click()
+    a.get_by_label('Текущий пароль').fill('test-secret')
+    a.get_by_label('Новый пароль',exact=True).fill('new-password-123')
+    a.get_by_label('Повторите новый пароль').fill('new-password-123')
+    a.get_by_role('button',name='Изменить пароль').click()
+    expect(a.get_by_text('Пароль изменён',exact=True)).to_be_visible()
+    a.reload()
+    expect(a.get_by_role('heading',name='Смена пароля администратора')).to_be_visible()
+    assert a.request.get(BASE+'/api/admin/state',headers={'Authorization':'Bearer test-secret'}).status==401
+    assert a.request.get(BASE+'/api/admin/state',headers={'Authorization':'Bearer new-password-123'}).ok
+    assert not errors,errors
+    b.close()
+    print('Admin management: OK')

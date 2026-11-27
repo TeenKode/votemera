@@ -27,6 +27,7 @@ with sync_playwright() as p:
     admin.get_by_label('Экран результатов').select_option('analysis');admin.get_by_role('button',name='Только режим экрана').click()
     expect(display.get_by_role('heading',name='Связь ответов')).to_be_visible()
     expect(display.get_by_text('100,0 п. п.')).to_be_visible()
+    admin.get_by_role('button',name='Аналитика',exact=True).click()
     admin.get_by_label('Визуализация').select_option('heatmap');admin.get_by_role('button',name='Сохранить пару вопросов').click()
     expect(display.locator('.heat-cell')).to_have_count(4)
     assert not errors,errors
