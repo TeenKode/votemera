@@ -685,7 +685,7 @@ def set_presentation(eid:int,v:Presentation):
     with db(True) as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
-        if external_source(c,eid): fail(409,'Сценарии для Яндекс Форм пока недоступны')
+        if external_source(c,eid) and v.slides: fail(409,'Сценарии для Яндекс Форм пока недоступны')
         n=len(questions(e))
         if len(set(v.order))!=len(v.order) or any(not 0<=i<n for i in v.order): fail(422,'Неверный порядок вопросов')
         if any(s.question>=n or (s.mode.startswith('analysis') and n<2) for s in v.slides): fail(422,'Неверный слайд')

@@ -466,3 +466,23 @@ def test_yandex_cloud_org_headers(client,monkeypatch):
     assert len(captured)==before
     assert client.get('/api/admin/yandex',headers=AUTH).json()['org']==cloud
     assert client.put('/api/admin/yandex',headers=AUTH,json={'org':cloud,'token':'invalid token'}).status_code==422
+
+def test_yandex_display_question_order(client,monkeypatch):
+    import json
+    import yandex_forms as yf
+    sid='b'*24
+    def mock(org,token,path,params=None):
+        if path=='/v1/users/me/':return {}
+        if path=='/v1/surveys':return {'result':[]}
+        if path.endswith('/questions'):return {'pages':[{'items':[{'id':i,'label':f'Вопрос {i}','type':'enum','items':[{'label':'Да'},{'label':'Нет'}]} for i in (10,11)]}]}
+        if '/answers' in path:return {'columns':[{'id':10},{'id':11}],'answers':[]}
+        raise AssertionError(path)
+    monkeypatch.setattr(yf,'request',mock)
+    assert client.put('/api/admin/yandex',headers=AUTH,json={'org':'bpf123456789','token':'mock-secret-123'}).is_success
+    created=client.post('/api/admin/yandex/events',headers=AUTH,json={'form_id':sid,'title':'Настройка экрана','questions':[10,11]}).json()
+    eid=created['id'];rid=created['round']
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={'order':[1],'seconds':15,'slides':[]}).is_success
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={'order':[1],'seconds':15,'slides':[{'mode':'live','question':1}]}).status_code==409
+    assert client.post('/api/admin/control',headers=AUTH,json={'event':eid,'round':rid,'opened':False,'display':'hidden'}).is_success
+    assert client.get('/api/admin/state',headers=AUTH).json()['event']['presentation']['order']==[1]
+    assert 'results' not in client.get('/api/state').json()['event']['rounds'][0]
