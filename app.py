@@ -40,6 +40,7 @@ VERIFIED_KEYS = OrderedDict()
 KEY_CACHE_LOCK = threading.Lock()
 STREAM_LOCK = threading.Lock()
 STREAM_CACHE = {}
+STREAM_REVISION = 0
 TERMINALS = OrderedDict()
 TERMINALS_LOCK = threading.Lock()
 DISPLAYS=OrderedDict()
@@ -50,6 +51,7 @@ DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голо�
 
 @contextmanager
 def db(write=False, transaction=True):
+    global STREAM_REVISION
     with (WRITE_LOCK if write else nullcontext()):
         DB.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(DB, timeout=10)
@@ -59,6 +61,7 @@ def db(write=False, transaction=True):
             if transaction: c.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
             yield c
             c.commit()
+            if write: STREAM_REVISION+=1
         except BaseException:
             c.rollback(); raise
         finally: c.close()
@@ -414,7 +417,7 @@ def state(view: Literal['vote','display']='display'):
 def stream_snapshot(view):
     # Coalesce expensive aggregate reads across simultaneous displays/terminals.
     with STREAM_LOCK:
-        key=(str(DB),view); now=time.monotonic(); cached=STREAM_CACHE.get(key)
+        key=(str(DB),view,STREAM_REVISION); now=time.monotonic(); cached=STREAM_CACHE.get(key)
         if cached and now-cached[0]<.20: return cached[1]
         with db() as c: data=json.dumps(snapshot(c,voting=view=='vote'),ensure_ascii=False,separators=(',',':'))
         if len(STREAM_CACHE)>8: STREAM_CACHE.clear()
@@ -758,6 +761,7 @@ def backup_database():
     return Response(data,media_type='application/x-sqlite3',headers={'Content-Disposition':'attachment; filename="votemera-backup.db"'})
 
 def restore_database(path):
+    global STREAM_REVISION
     def schema(c):
         return set(tuple(r) for r in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
     with WRITE_LOCK:
@@ -799,6 +803,7 @@ def restore_database(path):
                     live.backup(previous)
                     os.chmod(recovery,0o600)
                     source.backup(live)
+                    STREAM_REVISION+=1
         except (sqlite3.Error,ValueError,TypeError,IndexError,KeyError):
             fail(422,'Не удалось проверить или восстановить резервную копию')
     return {'ok':True}

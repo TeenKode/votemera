@@ -164,3 +164,14 @@ body[data-mode=vote][data-vote-style=contrast]{background:var(--bg)}
 body[data-mode=display][data-connection=offline] .screen-stage:after{content:'Нет связи с сервером — показаны последние полученные данные';position:absolute;bottom:0;left:0;right:0;z-index:4;background:#7a4510;color:#fff;padding:8px 10px;text-align:center;font-weight:700;font-size:clamp(12px,2vmin,20px);pointer-events:none}
 @media(max-width:480px){.screen-stage .vote-main .choices-2.choice-grid{grid-template-columns:1fr}.screen-stage .vote-main .choice-symbol{font-size:clamp(20px,4vmin,36px)}}
 @media(max-height:520px){.screen-stage .vote-main .choice-symbol{display:none}.screen-stage .vote-main .choice-list .choice{min-height:42px}}
+
+.screen-stage .vote-main:has(>.choices){height:100%;min-height:100%;max-height:none}
+.screen-stage .vote-main>.choices{flex:1 1 0;min-height:0;grid-auto-rows:minmax(0,1fr)}
+.screen-stage .vote-main .choice{min-height:0}
+.screen-stage .vote-main .choice-list .choice,.screen-stage .vote-main .choices-2.choice-grid .choice,.screen-stage .vote-main .choices-5.choice-grid .choice,.screen-stage .vote-main .choices-6.choice-grid .choice{min-height:0}
+.screen-stage .vote-main .choice-label{min-height:0;max-height:none}
+.screen-stage .vote-main .choice-symbol{flex:0 0 auto}
+.screen-stage .vote-main .vote-top,.screen-stage .vote-main .vote-question,.screen-stage .vote-main .question-description,.screen-stage .vote-main .vote-nav{flex:0 0 auto}
+/* If a screen is particularly short, retain a real minimum touch area and let the outer fitter scale the entire page. */
+.screen-stage .vote-main>.choices{min-height:calc(var(--choice-rows,2)*48px + (var(--choice-rows,2) - 1)*8px)}
+@media(max-width:480px){.screen-stage .vote-main>.choices.choices-2.choice-grid{--choice-rows:2!important}}

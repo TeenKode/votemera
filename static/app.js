@@ -30,7 +30,8 @@ function fitChoiceLabels(){
   let lo=14,hi=Math.max(lo,max);
   // Fit to the actual space, after reserving space for the icon and padding.
   const availableWidth=Math.max(1,width-2*parseFloat(getComputedStyle(b).paddingLeft)-8);
-  const availableHeight=Math.max(1,height-2*parseFloat(getComputedStyle(b).paddingTop)-(binary?Math.min(48,Math.floor(height*.20))+8:0)-6);
+  const symbol=b.querySelector('.choice-symbol');const iconHeight=symbol&&getComputedStyle(symbol).display!=='none'?symbol.offsetHeight+parseFloat(getComputedStyle(b).rowGap||0):0;
+  const availableHeight=Math.max(1,height-2*parseFloat(getComputedStyle(b).paddingTop)-iconHeight-6);
   label.style.maxWidth=availableWidth+'px';
   while(lo<hi){const n=Math.ceil((lo+hi)/2);label.style.fontSize=n+'px';if(label.scrollWidth<=availableWidth+1&&label.scrollHeight<=availableHeight+1)lo=n;else hi=n-1}
   label.style.fontSize=lo+'px';
@@ -155,7 +156,7 @@ function renderVote(){
  main.append(el('h1','vote-question',q.question));if(q.description)main.append(el('p','question-description',q.description));
  const accept=i=>{if(busy||!online||deviceLocked||!state?.opened||state.round!==s.round||state.epoch!==s.epoch||ballotScope!==scope||answers.length>=qs.length||i===null||(!q.confirm&&Date.now()<nextTapAt))return;nextTapAt=Date.now()+300;answers.push(i);selectedChoice=null;skipHidden(qs);if(answers.length===qs.length)send({round:s.round,epoch:s.epoch,choices:[...answers],nonce:hex(),terminal});else {saveDraft();renderVote()}};
  const layout=s.settings.vote_layout==='auto'?(q.options.some(o=>o.label.length>35)?'list':'grid'):s.settings.vote_layout;
- const choices=el('div','choices choice-'+layout+' choices-'+q.options.length);
+ const choices=el('div','choices choice-'+layout+' choices-'+q.options.length);choices.style.setProperty('--choice-rows',layout==='list'?q.options.length:Math.ceil(q.options.length/2));
  q.options.forEach((o,i)=>{
   const short=o.label.trim().length<=14;
   const binary=q.options.length===2&&q.options.every(x=>/^(да|нет|yes|no)$/iu.test(x.label.trim()));
@@ -171,7 +172,7 @@ function renderVote(){
  main.append(choices);const nav=el('div','vote-nav');if(answers.length)nav.append(btn('← Назад',()=>{do{selectedChoice=answers.pop()}while(selectedChoice===null&&answers.length);saveDraft();renderVote()}),btn('Начать заново',()=>{clearDraft();renderVote()}));else nav.append(el('span','muted','Коснитесь выбранного варианта ответа'));
  if(q.confirm){const next=btn(answers.length===qs.length-1?'Отправить ответы':'Далее →',()=>accept(selectedChoice),'');next.classList.add('vote-next');next.disabled=selectedChoice===null;nav.append(next)}main.append(nav);scheduleFit();
 }
-async function send(v){if(busy)return;busy=true;pending=v;saveDraft();clearTimeout(idleTimer);main.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api('/api/ballot','POST',v);clearDraft();main.replaceChildren(add(el('div','center wait'),el('div','success','✓'),el('h1','',state.settings.thank_you),el('p','muted','Терминал скоро будет готов к следующему участнику')));setTimeout(()=>{busy=false;renderVote()},state.settings.cooldown)}catch(e){busy=false;if(e.status===409||e.status===422){clearDraft()}else if(e.status===403){key='';sessionStorage.removeItem('votemera-key')}if(pending)saveDraft();toast(e.message||'Не удалось подтвердить голос');renderVote()}}
+async function send(v){if(busy)return;busy=true;pending=v;saveDraft();clearTimeout(idleTimer);main.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api('/api/ballot','POST',v);clearDraft();main.replaceChildren(add(el('div','center wait'),el('div','success','✓'),el('h1','',state.settings.thank_you),el('p','muted','Терминал скоро будет готов к следующему участнику')));setTimeout(()=>{busy=false;renderVote()},state.settings.cooldown)}catch(e){busy=false;if(e.status===409||e.status===422){clearDraft()}else if(e.status===423){deviceLocked=true;heartbeat()}else if(e.status===403){key='';sessionStorage.removeItem('votemera-key')}if(pending)saveDraft();toast(e.message||'Не удалось подтвердить голос');renderVote()}}
 let displayPage=0,displayPageScope='',rotateTimer=null,crossPage=0,crossScope='',crossTimer=null;
 function crossPanel(s,r){
  const ac=s.event.analysis, a=s.event.questions[ac.first],b=s.event.questions[ac.second],d=r.cross;
@@ -269,7 +270,7 @@ function startStream(){let es=null, generation=0, lastSeen=0, lastData='', fallb
   if(changed||!wasOnline){appearance(s);if(mode==='vote'){heartbeat();renderVote()}else{renderDisplay();displayHeartbeat()}}
  };
  function lost(){if(online){conn(false);if(mode==='vote')renderVote()}else conn(false)}
- function beginFallback(){if(fallback)return;fallback=true;generation++;es?.close();es=null;lost();retryAt=now()+15000;poll()}
+ function beginFallback(){if(fallback){if(es){generation++;es.close();es=null;retryAt=now()+15000}return}fallback=true;generation++;es?.close();es=null;lost();retryAt=now()+15000;poll()}
  function open(){
   const current=++generation;let received=false;
   es=new EventSource('/api/stream?view='+mode);
@@ -288,7 +289,7 @@ function startStream(){let es=null, generation=0, lastSeen=0, lastData='', fallb
  function check(){
   if(sandbox)return;
   if(!fallback&&now()-Math.max(lastSeen,lastTry)>7500)beginFallback();
-  if(fallback){poll();if(now()>=retryAt&&!polling){fallback=false;open()}}
+  if(fallback){if(es&&now()-lastTry>7500){generation++;es.close();es=null;retryAt=now()+15000}if(!es&&now()>=retryAt&&!polling)open();poll()}
  }
  open();setInterval(check,1000);
  window.addEventListener('offline',()=>{if(!sandbox)beginFallback()});
