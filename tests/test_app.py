@@ -486,3 +486,22 @@ def test_yandex_display_question_order(client,monkeypatch):
     assert client.post('/api/admin/control',headers=AUTH,json={'event':eid,'round':rid,'opened':False,'display':'hidden'}).is_success
     assert client.get('/api/admin/state',headers=AUTH).json()['event']['presentation']['order']==[1]
     assert 'results' not in client.get('/api/state').json()['event']['rounds'][0]
+
+def test_update_log_is_private_bounded_and_survives_status_change(client,monkeypatch,tmp_path):
+    status=tmp_path/'status';status.write_text('running')
+    log=tmp_path/'update.log'
+    monkeypatch.setattr(a,'UPDATE_STATUS',status)
+    monkeypatch.setattr(a,'UPDATE_REQUEST',tmp_path/'request')
+    assert client.get('/api/admin/update?log=true').status_code==401
+    assert client.get('/api/admin/update?log=true',headers=AUTH).json()['log']==''
+    log.write_text('Проверка релиза\n','utf-8')
+    data=client.get('/api/admin/update?log=true',headers=AUTH).json()
+    assert data['status']=='running' and 'Проверка релиза' in data['log']
+    assert 'log' not in client.get('/api/admin/update',headers=AUTH).json()
+    with log.open('a',encoding='utf-8') as f:f.write('a'*70000+'\nОбновление завершено\n')
+    status.write_text('success')
+    data=client.get('/api/admin/update?log=true',headers=AUTH).json()
+    assert data['status']=='success' and data['log_truncated']
+    assert data['log'].endswith('Обновление завершено\n')
+    assert len(data['log'].encode('utf-8'))<=65536
+    assert 'Обновление завершено' not in client.get('/api/state').text

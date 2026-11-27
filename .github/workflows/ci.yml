@@ -36,6 +36,7 @@ jobs:
           python tests/browser_viewport.py
           python tests/browser_realtime.py
           python tests/browser_yandex.py
+          python tests/browser_update.py
           python tests/browser_admin.py
           python tests/browser_operations.py
 
