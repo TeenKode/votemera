@@ -24,10 +24,10 @@ with sync_playwright() as p:
     expect(vote.get_by_role('button',name='Нет',exact=True)).to_be_enabled(timeout=6000)
     vote.get_by_role('button',name='Нет',exact=True).tap();vote.get_by_role('button',name='Много',exact=True).tap();vote.get_by_role('button',name='Отправить ответы').tap()
     expect(display.locator('.total-number')).to_have_text('2')
-    admin.get_by_label('Экран результатов').select_option('analysis');admin.get_by_role('button',name='Только режим экрана').click()
+    admin.locator('[data-section=overview] [data-display-mode=analysis]').click()
     expect(display.get_by_role('heading',name='Связь ответов')).to_be_visible()
     expect(display.get_by_text('100,0 п. п.')).to_be_visible()
-    admin.get_by_role('button',name='Аналитика',exact=True).click()
+    admin.get_by_text('Перекрёстный анализ',exact=True).click()
     admin.get_by_label('Визуализация').select_option('heatmap');admin.get_by_role('button',name='Сохранить пару вопросов').click()
     expect(display.locator('.heat-cell')).to_have_count(4)
     assert not errors,errors
