@@ -11,7 +11,7 @@ import time
 import subprocess
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext, closing
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -33,22 +33,25 @@ AUTH_FAILURES = OrderedDict()
 AUTH_LOCK = threading.Lock()
 TERMINALS = OrderedDict()
 TERMINALS_LOCK = threading.Lock()
+WRITE_LOCK = threading.RLock()
+MAX_BACKUP_BYTES = 64 * 1024 * 1024
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
 DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full', idle_timeout=90)
 
 @contextmanager
 def db(write=False, transaction=True):
-    DB.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB, timeout=10)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
-    try:
-        if transaction: c.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
-        yield c
-        c.commit()
-    except BaseException:
-        c.rollback(); raise
-    finally: c.close()
+    with (WRITE_LOCK if write else nullcontext()):
+        DB.parent.mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(DB, timeout=10)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA foreign_keys=ON')
+        try:
+            if transaction: c.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
+            yield c
+            c.commit()
+        except BaseException:
+            c.rollback(); raise
+        finally: c.close()
 
 def init():
     with db(transaction=False) as c:
@@ -496,6 +499,60 @@ def backup_database():
             source.backup(dest)
         data=target.read_bytes()
     return Response(data,media_type='application/x-sqlite3',headers={'Content-Disposition':'attachment; filename="votemera-backup.db"'})
+
+def restore_database(path):
+    def schema(c):
+        return set(tuple(r) for r in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
+    with WRITE_LOCK:
+        with db() as current:
+            if current.execute('SELECT opened FROM settings WHERE id=1').fetchone()[0]: fail(409,'Сначала закройте голосование')
+            if update_busy(): fail(409,'Дождитесь завершения обновления')
+            expected_schema=schema(current)
+        try:
+            with closing(sqlite3.connect(path,timeout=5)) as source:
+                source.row_factory=sqlite3.Row
+                source.execute('PRAGMA trusted_schema=OFF')
+                source.execute('PRAGMA foreign_keys=ON')
+                if schema(source)!=expected_schema: fail(422,'Несовместимая схема базы: используйте копию той же версии')
+                if source.execute('PRAGMA quick_check').fetchone()[0]!='ok' or source.execute('PRAGMA foreign_key_check').fetchone(): fail(422,'Повреждённая база')
+                if source.execute('SELECT count(*) FROM settings').fetchone()[0]!=1: fail(422,'Некорректные настройки')
+                source.execute('UPDATE settings SET opened=0,epoch=?,display=? WHERE id=1',(uuid4().hex,'hidden'))
+                source.commit()
+                preview=snapshot(source,private=True)
+                if not preview['event'] or not any(r['id']==preview['round'] for r in preview['event']['rounds']): fail(422,'Нет корректного активного мероприятия')
+                Settings.model_validate(preview['settings'])
+                for e in source.execute('SELECT * FROM events').fetchall():
+                    qs=questions(e)
+                    if not 1<=len(qs)<=12: fail(422,'Некорректная анкета')
+                    for q in qs: Question.model_validate(q)
+                    for r in source.execute('SELECT * FROM rounds WHERE event_id=?',(e['id'],)).fetchall():
+                        for vote in source.execute('SELECT DISTINCT question_index,choice FROM votes WHERE round_id=?',(r['id'],)):
+                            if not 0<=vote['question_index']<len(qs) or not 0<=vote['choice']<len(qs[vote['question_index']]['options']): fail(422,'Неверный индекс ответа')
+                directory=DB.parent/'restore-backups'
+                directory.mkdir(mode=0o700,exist_ok=True)
+                recovery=directory/(uuid4().hex+'.db')
+                with closing(sqlite3.connect(DB,timeout=10)) as live, closing(sqlite3.connect(recovery)) as previous:
+                    live.backup(previous)
+                    os.chmod(recovery,0o600)
+                    source.backup(live)
+        except (sqlite3.Error,ValueError,TypeError,IndexError,KeyError):
+            fail(422,'Не удалось проверить или восстановить резервную копию')
+    return {'ok':True}
+
+@app.post('/api/admin/restore',dependencies=[Depends(admin)])
+async def restore(request:Request):
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        path=Path(directory)/'restore.db'
+        size=0
+        with path.open('wb') as f:
+            async for chunk in request.stream():
+                size+=len(chunk)
+                if size>MAX_BACKUP_BYTES: fail(413,'Резервная копия превышает 64 МБ')
+                f.write(chunk)
+        with path.open('rb') as f:
+            if f.read(16)!=b'SQLite format 3\x00': fail(422,'Неверный формат резервной копии')
+        return await asyncio.to_thread(restore_database,path)
 
 @app.get('/api/admin/cross-export/{eid}',dependencies=[Depends(admin)])
 def cross_export(eid:int):
