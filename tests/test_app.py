@@ -203,3 +203,19 @@ def test_admin_rate_limit(client):
         for i in range(10): assert client.get('/api/admin/state').status_code==401
         assert client.get('/api/admin/state').status_code==429
     finally: a.AUTH_FAILURES.clear()
+
+def test_terminal_monitor_and_idle_timeout(client):
+    a.TERMINALS.clear()
+    t=uuid.uuid4().hex
+    assert client.post('/api/terminal/heartbeat',json={'terminal':t}).status_code==403
+    assert client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':t}).status_code==200
+    assert client.get('/api/admin/terminals').status_code==401
+    r=client.get('/api/admin/terminals',headers=AUTH).json()
+    assert r['online']==1 and r['terminals'][0]['id']==t[-8:]
+    cfg=client.get('/api/admin/state',headers=AUTH).json()['settings']
+    assert cfg['idle_timeout']==90
+    cfg['idle_timeout']=15
+    assert client.put('/api/admin/settings',headers=AUTH,json=cfg).status_code==200
+    assert client.get('/api/state?view=vote').json()['settings']['idle_timeout']==15
+    cfg['idle_timeout']=601
+    assert client.put('/api/admin/settings',headers=AUTH,json=cfg).status_code==422

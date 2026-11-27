@@ -17,6 +17,7 @@ with sync_playwright() as p:
     vote.goto(BASE+'/vote'); display.goto(BASE+'/display')
     vote.once('dialog',lambda d:d.accept('test-key'));vote.get_by_role('button',name='Подключить терминал').click()
     vote.get_by_role('button',name='Да',exact=True).tap();expect(vote.get_by_text('Вопрос 2 из 2')).to_be_visible()
+    vote.reload();expect(vote.get_by_text('Вопрос 2 из 2')).to_be_visible()
     vote.get_by_role('button',name='Мало',exact=True).tap();vote.get_by_role('button',name='Отправить ответы').tap()
     expect(vote.get_by_text('Спасибо за ваш голос!')).to_be_visible()
     expect(display.locator('.total-number')).to_have_text('1')

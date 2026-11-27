@@ -31,8 +31,10 @@ UPDATE_REQUEST = Path('/var/lib/votemera/update-request')
 UPDATE_REMOTE = 'https://github.com/TeenKode/votemera.git'
 AUTH_FAILURES = OrderedDict()
 AUTH_LOCK = threading.Lock()
+TERMINALS = OrderedDict()
+TERMINALS_LOCK = threading.Lock()
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
-DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full')
+DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full', idle_timeout=90)
 
 @contextmanager
 def db(write=False, transaction=True):
@@ -134,6 +136,7 @@ class Settings(BaseModel):
     display_rotate: int = Field(default=12,ge=0,le=120)
     vote_layout: Literal["auto","grid","list"] = "auto"
     motion: Literal["full","subtle","off"] = "full"
+    idle_timeout: int = Field(default=90,ge=0,le=600)
 class Control(BaseModel):
     event: int
     round: int
@@ -143,6 +146,9 @@ class AnalysisConfig(BaseModel):
     first: int = Field(ge=0,le=11)
     second: int = Field(ge=0,le=11)
     chart: Literal['stack','heatmap'] = 'stack'
+
+class TerminalHeartbeat(BaseModel):
+    terminal: str = Field(pattern=r'^[a-f0-9]{32}$')
 
 class Vote(BaseModel):
     round: int
@@ -297,6 +303,23 @@ def ballot(v:Ballot):
         if any(c.execute('SELECT 1 FROM votes WHERE nonce=?',(n,)).fetchone() for n in nonces): fail(409,'Конфликт идентификатора')
         c.executemany('INSERT INTO votes(round_id,choice,nonce,terminal,created,question_index,ballot_id) VALUES(?,?,?,?,?,?,?)',[(v.round,n,nonces[i],v.terminal,now,i,v.nonce) for i,n in enumerate(v.choices)])
     return {'ok':True,'duplicate':False}
+
+@app.post('/api/terminal/heartbeat',dependencies=[Depends(terminal)])
+def heartbeat(v:TerminalHeartbeat):
+    now=time.monotonic()
+    with TERMINALS_LOCK:
+        TERMINALS[v.terminal]=now
+        TERMINALS.move_to_end(v.terminal)
+        while TERMINALS and (len(TERMINALS)>4096 or next(iter(TERMINALS.values()))<now-300):
+            TERMINALS.popitem(last=False)
+    return {'ok':True}
+
+@app.get('/api/admin/terminals',dependencies=[Depends(admin)])
+def terminal_status():
+    now=time.monotonic()
+    with TERMINALS_LOCK:
+        rows=[dict(id=k[-8:],seconds_ago=int(now-t),online=now-t<25) for k,t in reversed(TERMINALS.items()) if now-t<300]
+    return {'online':sum(r['online'] for r in rows),'terminals':rows}
 
 @app.get('/api/admin/state',dependencies=[Depends(admin)])
 def admin_state():
