@@ -370,3 +370,18 @@ def test_release_resolver(monkeypatch):
     assert r.version_tuple('0.11.0')>r.version_tuple('0.9.2')
     monkeypatch.setattr(r.urllib.request,'urlopen',lambda *args,**kwargs:io.BytesIO(b'{"tag_name":"v0.12.0-rc1","draft":false,"prerelease":true}'))
     with pytest.raises(ValueError):r.latest_release()
+
+def test_vote_style_and_stream_cache(client):
+    state=client.get('/api/admin/state',headers=AUTH).json()
+    assert state['settings']['vote_style']=='contrast'
+    cfg=state['settings'];cfg['vote_style']='soft'
+    assert client.put('/api/admin/settings',headers=AUTH,json=cfg).is_success
+    assert client.get('/api/state?view=vote').json()['settings']['vote_style']=='soft'
+    s=activate(client)
+    import json
+    before=json.loads(a.stream_snapshot('display'))
+    assert before['event']['rounds'][0]['total']==0
+    assert submit(client,payload(s)).is_success
+    after=json.loads(a.stream_snapshot('display'))
+    assert after['event']['rounds'][0]['total']==1
+    assert 'results' not in json.loads(a.stream_snapshot('vote'))['event']['rounds'][0]

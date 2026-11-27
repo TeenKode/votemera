@@ -40,16 +40,18 @@ VERIFIED_KEYS = OrderedDict()
 KEY_CACHE_LOCK = threading.Lock()
 STREAM_LOCK = threading.Lock()
 STREAM_CACHE = {}
+STREAM_REVISION = 0
 TERMINALS = OrderedDict()
 TERMINALS_LOCK = threading.Lock()
 DISPLAYS=OrderedDict()
 WRITE_LOCK = threading.RLock()
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
-DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full', idle_timeout=90, backup_enabled=True, backup_retention=14)
+DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', vote_style='contrast', motion='full', idle_timeout=90, backup_enabled=True, backup_retention=14)
 
 @contextmanager
 def db(write=False, transaction=True):
+    global STREAM_REVISION
     with (WRITE_LOCK if write else nullcontext()):
         DB.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(DB, timeout=10)
@@ -59,6 +61,7 @@ def db(write=False, transaction=True):
             if transaction: c.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
             yield c
             c.commit()
+            if write: STREAM_REVISION+=1
         except BaseException:
             c.rollback(); raise
         finally: c.close()
@@ -236,6 +239,7 @@ class Settings(BaseModel):
     display_page_size: Literal[1,2,4] = 4
     display_rotate: int = Field(default=12,ge=0,le=120)
     vote_layout: Literal["auto","grid","list"] = "auto"
+    vote_style: Literal["contrast","soft"] = "contrast"
     motion: Literal["full","subtle","off"] = "full"
     idle_timeout: int = Field(default=90,ge=0,le=600)
     backup_enabled: bool=True
@@ -391,7 +395,7 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.middleware('http')
 async def headers(request, call_next):
     r=await call_next(request)
-    r.headers['Cache-Control']='no-store'
+    r.headers.setdefault('Cache-Control','no-store')
     r.headers['X-Content-Type-Options']='nosniff'
     r.headers['X-Frame-Options']='DENY'
     r.headers['Referrer-Policy']='no-referrer'
@@ -413,8 +417,8 @@ def state(view: Literal['vote','display']='display'):
 def stream_snapshot(view):
     # Coalesce expensive aggregate reads across simultaneous displays/terminals.
     with STREAM_LOCK:
-        key=(str(DB),view); now=time.monotonic(); cached=STREAM_CACHE.get(key)
-        if cached and now-cached[0]<.35: return cached[1]
+        key=(str(DB),view,STREAM_REVISION); now=time.monotonic(); cached=STREAM_CACHE.get(key)
+        if cached and now-cached[0]<.20: return cached[1]
         with db() as c: data=json.dumps(snapshot(c,voting=view=='vote'),ensure_ascii=False,separators=(',',':'))
         if len(STREAM_CACHE)>8: STREAM_CACHE.clear()
         STREAM_CACHE[key]=(time.monotonic(),data)
@@ -423,16 +427,21 @@ def stream_snapshot(view):
 @app.get('/api/stream')
 async def stream(request:Request, view: Literal['vote','display']='display'):
     async def events():
-        last=''; beat=0
+        last=None
+        last_sent=0.0
+        yield 'retry: 1000\n\n'
         while not await request.is_disconnected():
             data=await asyncio.to_thread(stream_snapshot,view)
+            now=time.monotonic()
             if data!=last:
-                yield 'data: '+data+'\n\n'; last=data; beat=0
-            elif beat>=30:
-                yield ': heartbeat\n\n'; beat=0
-            beat+=1
-            await asyncio.sleep(.4)
-    return StreamingResponse(events(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no'})
+                last=data; last_sent=now
+                yield 'data: '+data+'\n\n'
+            elif now-last_sent>=3:
+                last_sent=now
+                # Named event reaches JS, unlike an invisible SSE comment.
+                yield 'event: heartbeat\ndata: {}\n\n'
+            await asyncio.sleep(.25)
+    return StreamingResponse(events(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no','Cache-Control':'no-store, no-transform'})
 @app.post('/api/vote',dependencies=[Depends(terminal)])
 def vote(v:Vote):
     with db(True) as c:
@@ -752,6 +761,7 @@ def backup_database():
     return Response(data,media_type='application/x-sqlite3',headers={'Content-Disposition':'attachment; filename="votemera-backup.db"'})
 
 def restore_database(path):
+    global STREAM_REVISION
     def schema(c):
         return set(tuple(r) for r in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
     with WRITE_LOCK:
@@ -793,6 +803,7 @@ def restore_database(path):
                     live.backup(previous)
                     os.chmod(recovery,0o600)
                     source.backup(live)
+                    STREAM_REVISION+=1
         except (sqlite3.Error,ValueError,TypeError,IndexError,KeyError):
             fail(422,'Не удалось проверить или восстановить резервную копию')
     return {'ok':True}

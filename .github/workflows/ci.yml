@@ -34,6 +34,7 @@ jobs:
           python tests/browser_smoke.py
           python tests/browser_advanced.py
           python tests/browser_viewport.py
+          python tests/browser_realtime.py
           python tests/browser_admin.py
           python tests/browser_operations.py
 

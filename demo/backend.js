@@ -3,7 +3,7 @@
 const Demo=(()=>{
  const STORE='votemera-pages-demo-v1';
  const VERSION='__DEMO_VERSION__';
- const defaults={brand:'Votemera · ДЕМО',subtitle:'Локальная демонстрация',theme:'dark',accent:'#43c8bd',cooldown:900,show_percent:true,show_count:true,chart:'stack',thank_you:'Спасибо за ваш голос!',display_page_size:4,display_rotate:12,vote_layout:'auto',motion:'full',idle_timeout:90,backup_enabled:true,backup_retention:14};
+ const defaults={brand:'Votemera · ДЕМО',subtitle:'Локальная демонстрация',theme:'dark',accent:'#43c8bd',cooldown:900,show_percent:true,show_count:true,chart:'stack',thank_you:'Спасибо за ваш голос!',display_page_size:4,display_rotate:12,vote_layout:'auto',vote_style:'contrast',motion:'full',idle_timeout:90,backup_enabled:true,backup_retention:14};
  const opts=(labels)=>labels.map((label,i)=>({label,color:['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4'][i]}));
  const uid=()=>crypto.randomUUID().replaceAll('-','');
  function initial(){

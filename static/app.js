@@ -11,12 +11,39 @@ function countdownText(end){const n=Math.max(0,Math.ceil(end-Date.now()/1000));r
 function clockTick(){const node=$('countdown');if(node){node.hidden=!timerEnd;node.textContent=timerEnd?'Осталось '+countdownText(timerEnd):''}}
 let fitStage=null,fitFrame=0,fitViewport='',fitScale=1;
 function scheduleFit(){if(kiosk&&!fitFrame)fitFrame=requestAnimationFrame(fitScreen)}
+function choicePalette(hex){
+ const channels=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16));
+ const rgb=channels.every(Number.isFinite)?channels:[67,200,189];
+ const luma=values=>values.map(x=>{const c=x/255;return c<=.04045?c/12.92:((c+.055)/1.055)**2.4}).reduce((a,b,i)=>a+b*[.2126,.7152,.0722][i],0);
+ let factor=1;while(luma(rgb.map(x=>x*factor))>.13)factor*=.92;
+ return {fill:'rgb('+rgb.map(x=>Math.round(x*factor)).join(',')+')',border:'rgb('+rgb.map(x=>Math.round(x*.65+255*.35)).join(',')+')'};
+}
+function fitChoiceLabels(){
+ if(mode!=='vote')return;
+ for(const b of main.querySelectorAll('.choice')){
+  const label=b.querySelector('.choice-label');if(!label)continue;
+  const long=Number(label.dataset.length)>35;
+  const width=b.clientWidth,height=b.clientHeight;
+  if(!width||!height)continue;
+  const list=b.parentElement.classList.contains('choice-list'),binary=b.classList.contains('binary-answer');
+  const max=Math.min(binary?110:list?52:84,Math.floor(width/(long?8:5)),Math.floor(height*(binary?.34:list?.55:.48)));
+  let lo=14,hi=Math.max(lo,max);
+  // Fit to the actual space, after reserving space for the icon and padding.
+  const availableWidth=Math.max(1,width-2*parseFloat(getComputedStyle(b).paddingLeft)-8);
+  const symbol=b.querySelector('.choice-symbol');const iconHeight=symbol&&getComputedStyle(symbol).display!=='none'?symbol.offsetHeight+parseFloat(getComputedStyle(b).rowGap||0):0;
+  const availableHeight=Math.max(1,height-2*parseFloat(getComputedStyle(b).paddingTop)-iconHeight-6);
+  label.style.maxWidth=availableWidth+'px';
+  while(lo<hi){const n=Math.ceil((lo+hi)/2);label.style.fontSize=n+'px';if(label.scrollWidth<=availableWidth+1&&label.scrollHeight<=availableHeight+1)lo=n;else hi=n-1}
+  label.style.fontSize=lo+'px';
+ }
+}
 function fitScreen(){
  fitFrame=0;if(!fitStage||!fitStage.clientWidth||!fitStage.clientHeight)return;
  const w=fitStage.clientWidth,h=fitStage.clientHeight;
  const size=w+':'+h;
  if(fitViewport!==size){fitViewport=size;if(mode==='display'&&state)renderDisplay()}
  // Layout dimensions are untransformed, so shrinking never feeds back into measurement.
+ if(mode==='vote')fitChoiceLabels();
  const width=Math.max(main.offsetWidth,main.scrollWidth),height=Math.max(main.offsetHeight,main.scrollHeight);
  const scale=Math.min(1,w/Math.max(1,width),h/Math.max(1,height));
  if(Math.abs(scale-fitScale)>.0001){fitScale=scale;main.style.setProperty('--screen-scale',String(scale))}
@@ -82,8 +109,8 @@ let answers=[], ballotScope=null, displayFocus=-1, nextTapAt=0;
 let state=null, online=false, busy=false, pending=null, toastTimer, terminal=localStorage.getItem('votemera-terminal')||hex(), token=sessionStorage.getItem('votemera-admin')||'', key=sessionStorage.getItem('votemera-key')||'';
 localStorage.setItem('votemera-terminal',terminal);
 function toast(s){const n=$('toast');n.textContent=s;n.style.display='block';n.classList.remove('toast-out');clearTimeout(toastTimer);toastTimer=setTimeout(()=>{n.classList.add('toast-out');toastTimer=setTimeout(()=>{n.style.display='none'},motionDuration()?180:0)},4500)}
-function conn(v){online=v;$('connection').textContent=v?'В сети':'Связь потеряна';$('connection').classList.toggle('online',v)}
-function appearance(s){const c=s.settings;$('brand').textContent=c.brand;$('subtitle').textContent=c.subtitle;$('footer').textContent=c.brand;document.title=c.brand+' · '+({vote:'Голосование',display:'Результаты',admin:'Управление'}[mode]||'Главная');$('version').textContent='v'+s.version;timerEnd=s.opened?s.deadline:null;clockTick();const logo=$('event-logo');if(logo){logo.hidden=!s.logo;if(s.logo&&logo.getAttribute('src')!==s.logo)logo.src=s.logo;else if(!s.logo)logo.removeAttribute('src');}if(document.body.dataset.motion!==c.motion){document.body.dataset.motion=c.motion||'full';stopCounters()}document.body.classList.toggle('light',c.theme==='light');document.documentElement.style.setProperty('--accent',c.accent)}
+function conn(v,transport=''){online=v;const n=$('connection');n.textContent=v?(transport==='poll'?'В сети · резерв':'В сети'):'Связь потеряна';n.classList.toggle('online',v);n.dataset.transport=transport;document.body.dataset.connection=v?'online':'offline';}
+function appearance(s){const c=s.settings;$('brand').textContent=c.brand;$('subtitle').textContent=c.subtitle;$('footer').textContent=c.brand;document.title=c.brand+' · '+({vote:'Голосование',display:'Результаты',admin:'Управление'}[mode]||'Главная');$('version').textContent='v'+s.version;document.body.dataset.voteStyle=c.vote_style||'contrast';timerEnd=s.opened?s.deadline:null;clockTick();const logo=$('event-logo');if(logo){logo.hidden=!s.logo;if(s.logo&&logo.getAttribute('src')!==s.logo)logo.src=s.logo;else if(!s.logo)logo.removeAttribute('src');}if(document.body.dataset.motion!==c.motion){document.body.dataset.motion=c.motion||'full';stopCounters()}document.body.classList.toggle('light',c.theme==='light');document.documentElement.style.setProperty('--accent',c.accent)}
 $('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();else document.documentElement.requestFullscreen?.().catch(()=>toast('Используйте F11'))};
 async function api(path,method='GET',data,auth=false){const headers={};if(data!==undefined)headers['Content-Type']='application/json';if(auth)headers.Authorization='Bearer '+token;else if(key)headers['X-Terminal-Key']=key;const r=await fetch(path,{method,headers,body:data===undefined?undefined:JSON.stringify(data),cache:'no-store',signal:AbortSignal.timeout?AbortSignal.timeout(path.startsWith('/api/admin/update')?20000:8000):undefined});if(!r.ok){let msg='Ошибка '+r.status;try{const j=await r.json();msg=typeof j.detail==='string'?j.detail:msg}catch{}const e=new Error(msg);e.status=r.status;throw e}return r}
 function roundOf(s){return s.event?.rounds.find(r=>r.id===s.round)}
@@ -127,14 +154,25 @@ function renderVote(){
  if(pending){main.append(add(el('div','center wait'),el('h2','','Ответ не подтверждён'),el('p','muted','Повторная отправка не создаст второй голос.'),btn('Повторить отправку',()=>send(pending),''),btn('Отменить',()=>{if(confirm('Ответ мог быть записан. Отменить повторную отправку?')){clearDraft();renderVote()}})));return}
  if(!s.opened||!online){main.append(add(el('div','center wait'),el('h1','',online?'Голосование закрыто':'Нет связи с сервером'),el('p','muted',online?'Ожидайте начала этапа':'Ответы временно не принимаются')));return}
  main.append(el('h1','vote-question',q.question));if(q.description)main.append(el('p','question-description',q.description));
- const accept=i=>{if(busy||ballotScope!==scope||answers.length>=qs.length||(!q.confirm&&Date.now()<nextTapAt))return;nextTapAt=Date.now()+300;answers.push(i);selectedChoice=null;skipHidden(qs);if(answers.length===qs.length)send({round:s.round,epoch:s.epoch,choices:[...answers],nonce:hex(),terminal});else {saveDraft();renderVote()}};
+ const accept=i=>{if(busy||!online||deviceLocked||!state?.opened||state.round!==s.round||state.epoch!==s.epoch||ballotScope!==scope||answers.length>=qs.length||i===null||(!q.confirm&&Date.now()<nextTapAt))return;nextTapAt=Date.now()+300;answers.push(i);selectedChoice=null;skipHidden(qs);if(answers.length===qs.length)send({round:s.round,epoch:s.epoch,choices:[...answers],nonce:hex(),terminal});else {saveDraft();renderVote()}};
  const layout=s.settings.vote_layout==='auto'?(q.options.some(o=>o.label.length>35)?'list':'grid'):s.settings.vote_layout;
- const choices=el('div','choices choice-'+layout+' choices-'+q.options.length);
- q.options.forEach((o,i)=>{const b=btn('',()=>{if(q.confirm){selectedChoice=i;saveDraft();resetIdle();choices.querySelectorAll('.choice').forEach((choice,j)=>{choice.classList.toggle('selected',j===i);choice.setAttribute('aria-pressed',String(j===i));choice.querySelector('.choice-indicator').textContent=j===i?'✓':'›'});main.querySelector('.vote-next').disabled=false}else accept(i)},'choice'+(q.confirm&&selectedChoice===i?' selected':''));b.style.setProperty('--choice',o.color);b.style.setProperty('--order',i);b.setAttribute('aria-label',o.label);b.append(el('span','choice-index',String(i+1).padStart(2,'0')),el('span','choice-label',o.label),el('span','choice-indicator',q.confirm&&selectedChoice===i?'✓':'›'));if(q.confirm)b.setAttribute('aria-pressed',String(selectedChoice===i));choices.append(b)});
- main.append(choices);const nav=el('div','vote-nav');if(answers.length)nav.append(btn('← Назад',()=>{do{selectedChoice=answers.pop()}while(selectedChoice===null&&answers.length);saveDraft();renderVote()}),btn('Начать заново',()=>{clearDraft();renderVote()}));else nav.append(el('span','muted','Выберите один вариант'));
- if(q.confirm){const next=btn(answers.length===qs.length-1?'Отправить ответы':'Далее →',()=>accept(selectedChoice),'');next.classList.add('vote-next');next.disabled=selectedChoice===null;nav.append(next)}main.append(nav);
+ const choices=el('div','choices choice-'+layout+' choices-'+q.options.length);choices.style.setProperty('--choice-rows',layout==='list'?q.options.length:Math.ceil(q.options.length/2));
+ q.options.forEach((o,i)=>{
+  const short=o.label.trim().length<=14;
+  const binary=q.options.length===2&&q.options.every(x=>/^(да|нет|yes|no)$/iu.test(x.label.trim()));
+  const symbol=binary?(/^(да|yes)$/iu.test(o.label.trim())?'✓':'×'):'';
+  const b=btn('',()=>{if(busy||!online||deviceLocked||!state?.opened||ballotScope!==scope)return;if(q.confirm){selectedChoice=i;saveDraft();resetIdle();choices.querySelectorAll('.choice').forEach((choice,j)=>{choice.classList.toggle('selected',j===i);choice.setAttribute('aria-pressed',String(j===i));choice.querySelector('.choice-indicator').textContent=j===i?'✓':''});main.querySelector('.vote-next').disabled=false}else accept(i)},'choice'+(short?' short-answer':'')+(binary?' binary-answer':'')+(q.confirm&&selectedChoice===i?' selected':''));
+  b.style.setProperty('--choice',o.color);b.style.setProperty('--order',i);b.setAttribute('aria-label',o.label);
+  const palette=choicePalette(o.color);b.style.setProperty('--choice-fill',palette.fill);b.style.setProperty('--choice-border',palette.border);
+  if(symbol){const mark=el('span','choice-symbol',symbol);mark.setAttribute('aria-hidden','true');b.append(mark)}
+  const label=el('span','choice-label',o.label);label.dataset.length=String(o.label.trim().length);
+  const indicator=el('span','choice-indicator',q.confirm&&selectedChoice===i?'✓':'');indicator.setAttribute('aria-hidden','true');
+  b.append(label,indicator);if(q.confirm)b.setAttribute('aria-pressed',String(selectedChoice===i));choices.append(b)
+ });
+ main.append(choices);const nav=el('div','vote-nav');if(answers.length)nav.append(btn('← Назад',()=>{do{selectedChoice=answers.pop()}while(selectedChoice===null&&answers.length);saveDraft();renderVote()}),btn('Начать заново',()=>{clearDraft();renderVote()}));else nav.append(el('span','muted','Коснитесь выбранного варианта ответа'));
+ if(q.confirm){const next=btn(answers.length===qs.length-1?'Отправить ответы':'Далее →',()=>accept(selectedChoice),'');next.classList.add('vote-next');next.disabled=selectedChoice===null;nav.append(next)}main.append(nav);scheduleFit();
 }
-async function send(v){if(busy)return;busy=true;pending=v;saveDraft();clearTimeout(idleTimer);main.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api('/api/ballot','POST',v);clearDraft();main.replaceChildren(add(el('div','center wait'),el('div','success','✓'),el('h1','',state.settings.thank_you),el('p','muted','Терминал скоро будет готов к следующему участнику')));setTimeout(()=>{busy=false;renderVote()},state.settings.cooldown)}catch(e){busy=false;if(e.status===409||e.status===422){clearDraft()}else if(e.status===403){key='';sessionStorage.removeItem('votemera-key')}if(pending)saveDraft();toast(e.message||'Не удалось подтвердить голос');renderVote()}}
+async function send(v){if(busy)return;busy=true;pending=v;saveDraft();clearTimeout(idleTimer);main.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api('/api/ballot','POST',v);clearDraft();main.replaceChildren(add(el('div','center wait'),el('div','success','✓'),el('h1','',state.settings.thank_you),el('p','muted','Терминал скоро будет готов к следующему участнику')));setTimeout(()=>{busy=false;renderVote()},state.settings.cooldown)}catch(e){busy=false;if(e.status===409||e.status===422){clearDraft()}else if(e.status===423){deviceLocked=true;heartbeat()}else if(e.status===403){key='';sessionStorage.removeItem('votemera-key')}if(pending)saveDraft();toast(e.message||'Не удалось подтвердить голос');renderVote()}}
 let displayPage=0,displayPageScope='',rotateTimer=null,crossPage=0,crossScope='',crossTimer=null;
 function crossPanel(s,r){
  const ac=s.event.analysis, a=s.event.questions[ac.first],b=s.event.questions[ac.second],d=r.cross;
@@ -222,8 +260,43 @@ async function heartbeat(){if(mode!=='vote'||!online||heartbeatBusy||(state?.ter
 if(mode==='vote')setInterval(heartbeat,3000);
 function displayHeartbeat(){if(mode==='display'&&!sandbox&&online){let id=sessionStorage.getItem('votemera-display-id');if(!id){id=hex();sessionStorage.setItem('votemera-display-id',id)}api('/api/display/heartbeat','POST',{terminal:id}).catch(()=>{})}}
 if(mode==='display')setInterval(displayHeartbeat,5000);
-function demoDisplay(){let current=null;const es=new EventSource('/api/stream?view=vote');es.onmessage=e=>{const s=JSON.parse(e.data);if(!s.event)return;const id=s.event.id;if(current?.event.id!==id){current=s;current.event.title='ДЕМО · '+s.event.title;current.display='compare';current.opened=true;for(const r of current.event.rounds){r.results=s.event.questions.map(q=>({counts:q.options.map(()=>0),total:0}));r.total=0}}state=current;appearance(state);$('subtitle').textContent='Демонстрация · данные вымышлены';conn(true);renderDisplay()};es.onerror=()=>conn(false);setInterval(()=>{if(!current)return;for(const r of current.event.rounds){r.total++;for(const q of r.results){q.counts[Math.floor(Math.random()*q.counts.length)]++;q.total++}}renderDisplay()},900)}
-function startStream(){const es=new EventSource('/api/stream?view='+mode);es.onopen=()=>conn(true);es.onmessage=e=>{state=JSON.parse(e.data);conn(true);appearance(state);if(mode==='vote'){heartbeat();renderVote()}else {renderDisplay();displayHeartbeat()}};es.onerror=()=>{conn(false);if(mode==='vote')renderVote()}}
+function demoDisplay(){let current=null;const es=new EventSource('/api/stream?view=vote');es.onmessage=e=>{const s=JSON.parse(e.data);if(!s.event)return;const id=s.event.id;if(current?.event.id!==id){current=s;current.event.title='ДЕМО · '+s.event.title;current.display='compare';current.opened=true;for(const r of current.event.rounds){r.results=s.event.questions.map(q=>({counts:q.options.map(()=>0),total:0}));r.total=0}}state=current;appearance(state);$('subtitle').textContent='Демонстрация · данные вымышлены';conn(true);renderDisplay()};es.onerror=()=>conn(false);setInterval(()=>{if(!current||!online)return;for(const r of current.event.rounds){r.total++;for(const q of r.results){q.counts[Math.floor(Math.random()*q.counts.length)]++;q.total++}}renderDisplay()},900)}
+function startStream(){let es=null, generation=0, lastSeen=0, lastData='', fallback=false, polling=false, lastTry=0, retryAt=0;
+ const now=()=>Date.now();
+ const apply=(s,transport)=>{
+  if(!s||typeof s!=='object'||!s.settings)return;
+  const data=JSON.stringify(s),changed=data!==lastData,wasOnline=online;
+  lastData=data;state=s;lastSeen=now();conn(true,transport);
+  if(changed||!wasOnline){appearance(s);if(mode==='vote'){heartbeat();renderVote()}else{renderDisplay();displayHeartbeat()}}
+ };
+ function lost(){if(online){conn(false);if(mode==='vote')renderVote()}else conn(false)}
+ function beginFallback(){if(fallback){if(es){generation++;es.close();es=null;retryAt=now()+15000}return}fallback=true;generation++;es?.close();es=null;lost();retryAt=now()+15000;poll()}
+ function open(){
+  const current=++generation;let received=false;
+  es=new EventSource('/api/stream?view='+mode);
+  lastTry=now();
+  es.onmessage=e=>{if(current!==generation)return;try{const data=JSON.parse(e.data);received=true;fallback=false;apply(data,'sse')}catch{beginFallback()}};
+  es.addEventListener?.('heartbeat',()=>{if(current!==generation||!received)return;lastSeen=now();conn(true,'sse')});
+  // A connected TCP stream is not proof that snapshots are current.
+  es.onerror=()=>{if(current===generation&&!sandbox)beginFallback();else if(current===generation)lost()};
+ }
+ async function poll(){
+  if(!fallback||polling)return;polling=true;const current=generation;
+  try{const s=await(await api('/api/state?view='+mode)).json();if(fallback&&current===generation)apply(s,'poll')}
+  catch{if(fallback&&current===generation)lost()}
+  finally{polling=false}
+ }
+ function check(){
+  if(sandbox)return;
+  if(!fallback&&now()-Math.max(lastSeen,lastTry)>7500)beginFallback();
+  if(fallback){if(es&&now()-lastTry>7500){generation++;es.close();es=null;retryAt=now()+15000}if(!es&&now()>=retryAt&&!polling)open();poll()}
+ }
+ open();setInterval(check,1000);
+ window.addEventListener('offline',()=>{if(!sandbox)beginFallback()});
+ window.addEventListener('online',()=>{if(!sandbox&&fallback){retryAt=0;check()}});
+ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!sandbox){if(now()-lastSeen>3500&&!fallback)beginFallback();check()}});
+ window.addEventListener('pagehide',()=>es?.close());
+ window.addEventListener('pageshow',e=>{if(e.persisted){fallback=false;open()}});}
 function field(parent,label,value,type='text'){const id='f-'+hex();const l=el('label','',label);l.htmlFor=id;const n=el(type==='textarea'?'textarea':'input');n.id=id;if(type!=='textarea')n.type=type;n.value=value;parent.append(l,n);return n}
 function select(parent,label,items,value){const l=el('label','',label),n=el('select');n.id='f-'+hex();l.htmlFor=n.id;items.forEach(([v,t])=>{const o=el('option','',t);o.value=v;n.append(o)});n.value=value;parent.append(l,n);return n}
 function check(parent,label,value){const row=el('div','check'),n=el('input');n.type='checkbox';n.checked=value;n.id='f-'+hex();const l=el('label','',' '+label);l.htmlFor=n.id;row.append(n,l);parent.append(row);return n}
@@ -285,7 +358,7 @@ function eventManager(parent,s,editor){
  row.append(meta,actions);list.append(row)}if(!list.children.length)list.append(el('p','muted','Мероприятий не найдено'))}search.oninput=draw;filter.onchange=()=>{sessionStorage.setItem('votemera-event-filter',filter.value);draw()};draw();
 }
 function adminControls(parent,s,editor){const control=el('section','panel');control.append(el('h2','','Управление мероприятием'));parent.append(control);const event=select(control,'Мероприятие',s.events.filter(e=>!e.archived&&!e.template||e.id===s.event.id).map(e=>[e.id,e.title]),s.event.id);const round=select(control,'Этап',s.event.rounds.map(r=>[r.id,r.name]),s.round);const disp=select(control,'Экран результатов',[['live','Текущий этап'],['compare','Сравнение этапов'],['analysis','Связь ответов — текущий этап'],['analysis_compare','Связь ответов — все этапы'],['presentation','Сценарий показа'],['hidden','Скрыть результаты']],s.display);const status=el('p','notice',s.opened?'Сейчас голосование открыто':'Сейчас голосование закрыто');control.append(status);const duration=field(control,'Таймер, минут (0 — без ограничения)',0,'number');duration.min=0;duration.max=1440;let selected=s.event;let requestId=0;event.onchange=async()=>{const id=++requestId;round.disabled=true;try{const next=await(await api('/api/admin/event/'+event.value,'GET',undefined,true)).json();if(id!==requestId)return;selected=next;round.replaceChildren(...selected.rounds.map(r=>{const o=el('option','',r.name);o.value=r.id;return o}));round.disabled=false}catch(e){toast(e.message)}};const set=open=>{if(round.disabled)return toast('Дождитесь загрузки этапов');const seconds=Math.round(Number(duration.value)*60);if(!Number.isFinite(seconds)||seconds<0||seconds>86400)return toast('Неверное время таймера');action('/api/admin/control','POST',{event:+event.value,round:+round.value,opened:open,display:disp.value,duration:open?seconds:0})};control.append(add(el('div','actions'),btn('Открыть этап',()=>set(true),''),btn('Закрыть этап',()=>set(false)),btn('Только режим экрана',()=>action('/api/admin/live','PATCH',{display:disp.value}))));control.append(el('p','muted','Выбор мероприятия или этапа применяется кнопкой открытия/закрытия.'));const hist=el('div');for(const r of s.event.rounds){hist.append(add(el('div','row'),el('span','',r.name+': '+r.total),btn('Очистить',()=>{if(confirm('Удалить все голоса этапа «'+r.name+'»?'))action('/api/admin/round/'+r.id+'/votes','DELETE')},'danger')))}control.append(hist,add(el('div','actions'),btn('Экспорт CSV',async()=>{try{const r=await api('/api/admin/export/'+event.value,'GET',undefined,true);const url=URL.createObjectURL(await r.blob()),a=el('a');a.href=url;a.download='votemera-'+event.value+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){toast(e.message)}}),btn('Редактировать выбранное',async()=>{try{const e=await(await api('/api/admin/event/'+event.value,'GET',undefined,true)).json();showAdminSection('events');editor.hidden=false;renderEditor(editor,e)}catch(e){toast(e.message)}})));}
-function adminSettings(parent,s){const cfg=el('section','panel');parent.append(cfg);cfg.append(el('h2','','Настройки оформления и терминалов'));const c=s.settings;const backupEnabled=check(cfg,'Ежедневные резервные копии',c.backup_enabled??true),backupRetention=field(cfg,'Хранить ежедневных копий',c.backup_retention??14,'number');backupRetention.min=1;backupRetention.max=90;const idle=field(cfg,'Сброс незавершённой анкеты, секунд (0 — выключено)',c.idle_timeout??90,'number');const brand=field(cfg,'Название системы',c.brand),subtitle=field(cfg,'Подзаголовок',c.subtitle),theme=select(cfg,'Тема',[['dark','Тёмная'],['light','Светлая']],c.theme),accent=field(cfg,'Акцентный цвет',c.accent,'color'),cool=field(cfg,'Пауза после голоса, мс (500–10000)',c.cooldown,'number'),thank=field(cfg,'Сообщение после ответа',c.thank_you),chart=select(cfg,'Тип диаграммы',[['stack','Общая шкала'],['bars','Отдельные полосы'],['donut','Кольцевая диаграмма']],c.chart),count=check(cfg,'Показывать количество ответов',c.show_count),percent=check(cfg,'Показывать проценты',c.show_percent),pageSize=select(cfg,'Вопросов на одном экране',[[1,'1 — крупный план'],[2,'2 — рядом'],[4,'4 — обзор']],c.display_page_size),rotate=field(cfg,'Автопереключение страниц, секунд (0 — выключено)',c.display_rotate,'number'),voteLayout=select(cfg,'Расположение кнопок терминала',[['auto','Автоматически'],['grid','Плитки'],['list','Список']],c.vote_layout),motion=select(cfg,'Анимации интерфейса',[['full','Плавные и выразительные'],['subtle','Минимальные'],['off','Выключены']],c.motion||'full');cfg.append(add(el('div','actions'),btn('Сохранить настройки',()=>action('/api/admin/settings','PUT',{brand:brand.value,subtitle:subtitle.value,theme:theme.value,accent:accent.value,cooldown:+cool.value,thank_you:thank.value,chart:chart.value,show_count:count.checked,show_percent:percent.checked,display_page_size:+pageSize.value,display_rotate:+rotate.value,vote_layout:voteLayout.value,motion:motion.value,idle_timeout:+idle.value,backup_enabled:backupEnabled.checked,backup_retention:+backupRetention.value}),'')));}
+function adminSettings(parent,s){const cfg=el('section','panel');parent.append(cfg);cfg.append(el('h2','','Настройки оформления и терминалов'));const c=s.settings;const backupEnabled=check(cfg,'Ежедневные резервные копии',c.backup_enabled??true),backupRetention=field(cfg,'Хранить ежедневных копий',c.backup_retention??14,'number');backupRetention.min=1;backupRetention.max=90;const idle=field(cfg,'Сброс незавершённой анкеты, секунд (0 — выключено)',c.idle_timeout??90,'number');const brand=field(cfg,'Название системы',c.brand),subtitle=field(cfg,'Подзаголовок',c.subtitle),theme=select(cfg,'Тема',[['dark','Тёмная'],['light','Светлая']],c.theme),accent=field(cfg,'Акцентный цвет',c.accent,'color'),cool=field(cfg,'Пауза после голоса, мс (500–10000)',c.cooldown,'number'),thank=field(cfg,'Сообщение после ответа',c.thank_you),chart=select(cfg,'Тип диаграммы',[['stack','Общая шкала'],['bars','Отдельные полосы'],['donut','Кольцевая диаграмма']],c.chart),count=check(cfg,'Показывать количество ответов',c.show_count),percent=check(cfg,'Показывать проценты',c.show_percent),pageSize=select(cfg,'Вопросов на одном экране',[[1,'1 — крупный план'],[2,'2 — рядом'],[4,'4 — обзор']],c.display_page_size),rotate=field(cfg,'Автопереключение страниц, секунд (0 — выключено)',c.display_rotate,'number'),voteLayout=select(cfg,'Расположение кнопок терминала',[['auto','Автоматически'],['grid','Плитки'],['list','Список']],c.vote_layout),voteStyle=select(cfg,'Оформление кнопок терминала',[['contrast','Высокая контрастность'],['soft','Спокойное оформление']],c.vote_style||'contrast'),motion=select(cfg,'Анимации интерфейса',[['full','Плавные и выразительные'],['subtle','Минимальные'],['off','Выключены']],c.motion||'full');cfg.append(add(el('div','actions'),btn('Сохранить настройки',()=>action('/api/admin/settings','PUT',{brand:brand.value,subtitle:subtitle.value,theme:theme.value,accent:accent.value,cooldown:+cool.value,thank_you:thank.value,chart:chart.value,show_count:count.checked,show_percent:percent.checked,display_page_size:+pageSize.value,display_rotate:+rotate.value,vote_layout:voteLayout.value,vote_style:voteStyle.value,motion:motion.value,idle_timeout:+idle.value,backup_enabled:backupEnabled.checked,backup_retention:+backupRetention.value}),'')));}
 function renderAdmin(){
  const s=adminState;main.className='admin admin-shell';main.replaceChildren();adminSections=new Map();adminNav=new Map();
  const side=el('aside','admin-sidebar'),nav=el('nav','admin-nav');nav.setAttribute('aria-label','Разделы управления');side.append(el('div','eyebrow','Управление'),nav);
