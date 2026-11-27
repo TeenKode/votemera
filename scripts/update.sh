@@ -5,7 +5,10 @@ cd /opt/votemera
 [[ -d .git ]] || { echo 'Обновление требует Git-клона в /opt/votemera'; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo 'Рабочее дерево изменено; обновление отменено'; exit 1; }
 old=$(git rev-parse HEAD)
-git fetch --no-tags origin
+# Official public origin only; never prompt for secrets in systemd or the console.
+export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+[[ $(git remote get-url origin) == https://github.com/TeenKode/votemera.git ]] || { echo 'Неверный URL origin: ожидается официальный публичный репозиторий TeenKode/votemera'; exit 1; }
+git -c credential.helper= fetch --no-tags origin || { echo 'Не удалось получить обновления с GitHub без авторизации. Проверьте сеть и публичную доступность репозитория.' >&2; exit 1; }
 branch=$(git symbolic-ref --short HEAD)
 git merge-base --is-ancestor HEAD "origin/$branch" || { echo 'Не fast-forward'; exit 1; }
 [[ $(git rev-parse "origin/$branch") != "$old" ]] || { echo 'Уже актуально'; exit 0; }
