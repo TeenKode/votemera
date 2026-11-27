@@ -1,0 +1,25 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - run: node --check static/app.js
+      - run: node --test tests/motion.test.cjs
+      - run: bash -n scripts/install.sh scripts/update.sh
+      - run: pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Browser end-to-end
+        run: |
+          export VOTEMERA_DB="$RUNNER_TEMP/votemera-browser.db" VOTEMERA_ADMIN_PASSWORD=test-secret VOTEMERA_TERMINAL_KEY=test-key
+          python -m uvicorn app:app --host 127.0.0.1 --port 8765 &
+          pid=$!
+          trap 'kill "$pid"' EXIT
+          for i in {1..30}; do curl -fsS http://127.0.0.1:8765/health && break; sleep 1; done
+          python tests/browser_smoke.py
