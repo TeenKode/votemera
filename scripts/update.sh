@@ -4,7 +4,8 @@ set -euo pipefail
 cd /opt/votemera
 [[ -d .git ]] || { echo 'Обновление требует Git-клона в /opt/votemera'; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo 'Рабочее дерево изменено; обновление отменено'; exit 1; }
-exec 9>/run/lock/votemera-update.lock
+install -d -m 0700 -o root -g root /var/backups/votemera
+exec 9>/var/backups/votemera/.maintenance.lock
 flock -n 9 || { echo 'Обновление уже выполняется'; exit 1; }
 old=$(git rev-parse HEAD)
 [[ $(sqlite3 /var/lib/votemera/votemera.db "SELECT opened AND (deadline IS NULL OR deadline>CAST(strftime('%s','now') AS INTEGER)) FROM settings CROSS JOIN runtime_config WHERE settings.id=1 AND runtime_config.id=1;") == 0 ]] || { echo 'Сначала закройте голосование'; exit 1; }

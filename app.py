@@ -721,7 +721,6 @@ def update_info(check: bool=False):
     info=dict(version=VERSION,status='queued' if UPDATE_REQUEST.exists() else status,available=None,latest=None)
     if check and status!='unavailable' and not update_busy():
         try:
-            local=subprocess.check_output(['git','-c',f'safe.directory={ROOT}','-C',str(ROOT),'rev-parse','HEAD'],text=True,timeout=5).strip()
             from release_target import latest_release,version_tuple
             release=latest_release()
             info.update(available=version_tuple(release['version'])>version_tuple(VERSION),latest=release['version'])

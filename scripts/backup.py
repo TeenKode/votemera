@@ -52,7 +52,7 @@ def main():
 
 if __name__=='__main__':
     try:
-        with open('/run/lock/votemera-update.lock','a') as lock:
+        with open(BASE.parent/'.maintenance.lock','a') as lock:
             fcntl.flock(lock,fcntl.LOCK_SH)
             main()
     except Exception:
