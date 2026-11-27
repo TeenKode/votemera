@@ -93,6 +93,7 @@ def init_access():
     with access_db(True) as c:
         c.execute('CREATE TABLE IF NOT EXISTS access_settings(id INTEGER PRIMARY KEY CHECK(id=1),password_salt BLOB NOT NULL,password_hash TEXT NOT NULL,key_salt BLOB NOT NULL,required INTEGER NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS terminal_keys(id INTEGER PRIMARY KEY,label TEXT NOT NULL,digest TEXT UNIQUE NOT NULL,created REAL NOT NULL,enabled INTEGER NOT NULL DEFAULT 1)')
+        c.execute('CREATE TABLE IF NOT EXISTS yandex_credentials(id INTEGER PRIMARY KEY CHECK(id=1),org TEXT NOT NULL,token TEXT NOT NULL,revision TEXT NOT NULL)')
         if c.execute('SELECT 1 FROM access_settings WHERE id=1').fetchone(): return
         salt=secrets.token_bytes(32); key_salt=secrets.token_bytes(32)
         c.execute('INSERT INTO access_settings VALUES(1,?,?,?,?)',(salt,password_hash(ADMIN,salt) if ADMIN else '',key_salt,int(bool(TERMINAL))))
@@ -163,6 +164,7 @@ def init():
         c.execute('CREATE TABLE IF NOT EXISTS runtime_config(id INTEGER PRIMARY KEY CHECK(id=1),deadline REAL)')
         c.execute('INSERT OR IGNORE INTO runtime_config(id) VALUES(1)')
         c.execute('CREATE TABLE IF NOT EXISTS terminal_config(id TEXT PRIMARY KEY,label TEXT NOT NULL DEFAULT "",locked INTEGER NOT NULL DEFAULT 0,event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,revision INTEGER NOT NULL DEFAULT 0)')
+        c.execute('CREATE TABLE IF NOT EXISTS yandex_source(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE, org TEXT NOT NULL, form_id TEXT NOT NULL, spec TEXT NOT NULL, date_from TEXT NOT NULL, date_to TEXT NOT NULL, interval INTEGER NOT NULL, revision TEXT NOT NULL, aggregate TEXT NOT NULL, last_sync REAL, error TEXT NOT NULL DEFAULT "", enabled INTEGER NOT NULL DEFAULT 1)')
         c.execute('CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,created REAL NOT NULL,action TEXT NOT NULL,detail TEXT NOT NULL)')
         c.execute('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)',(json.dumps(DEFAULTS),))
         if not c.execute('SELECT 1 FROM events LIMIT 1').fetchone():
@@ -314,7 +316,15 @@ def validate_event(e):
     if any(len(n)>80 for n in names) or len(set(n.casefold() for n in names))!=len(names): fail(422,'Названия этапов должны быть уникальными и не длиннее 80 символов')
     return qs,names
 
+def external_source(c,eid):
+    return c.execute('SELECT * FROM yandex_source WHERE event_id=?',(eid,)).fetchone()
+
+def external_round(c,rid):
+    return c.execute('SELECT y.* FROM yandex_source y JOIN rounds r ON r.event_id=y.event_id WHERE r.id=?',(rid,)).fetchone()
+
 def results(c,rid,qs):
+    ext=external_round(c,rid)
+    if ext: return json.loads(ext['aggregate'])['results']
     items=[dict(counts=[0]*len(q['options'])) for q in qs]
     for v in c.execute('SELECT question_index,choice,count(*) n FROM votes WHERE round_id=? GROUP BY question_index,choice',(rid,)):
         items[v['question_index']]['counts'][v['choice']]=v['n']
@@ -322,7 +332,7 @@ def results(c,rid,qs):
     return items
 
 def analysis_config(c,eid,qs):
-    if len(qs)<2: return None
+    if len(qs)<2 or external_source(c,eid): return None
     row=c.execute('SELECT first_q,second_q,chart FROM analysis_config WHERE event_id=?',(eid,)).fetchone()
     if row and row['first_q']!=row['second_q'] and max(row['first_q'],row['second_q'])<len(qs):
         return dict(first=row['first_q'],second=row['second_q'],chart=row['chart'])
@@ -369,7 +379,8 @@ def snapshot(c, private=False, voting=False):
     e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
     result=dict(settings=cfg, event=None, round=s['active_round'], opened=effective_open(c,s), deadline=deadline(c), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
     if e:
-        qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs); m=meta(c,e['id'])
+        qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs); m=meta(c,e['id']); ext=external_source(c,e['id'])
+        if ext: result['external']=dict(provider='yandex',url='https://forms.yandex.ru/cloud/u/'+ext['form_id']+'/',last_sync=ext['last_sync'],stale=bool(ext['error']) or not ext['enabled'],enabled=bool(ext['enabled'])); result['opened']=False
         if m['brand']: cfg['brand']=m['brand']
         if m['accent']: cfg['accent']=m['accent']
         result['logo']=m['logo']
@@ -378,7 +389,7 @@ def snapshot(c, private=False, voting=False):
             item=dict(id=r['id'],name=r['name'])
             if private or (not voting and s['display']!='hidden' and (s['display'] in ('compare','analysis_compare','presentation') or r['id']==s['active_round'])):
                 rs=results(c,r['id'],qs)
-                item.update(counts=rs[0]['counts'],total=rs[0]['total'],results=rs)
+                item.update(counts=rs[0]['counts'],total=json.loads(ext['aggregate'])['total'] if ext else rs[0]['total'],results=rs)
                 if ac and (private or s['display'] in ('analysis','analysis_compare','presentation')):
                     item['cross']=cross_results(c,r['id'],qs,ac['first'],ac['second'])
             rounds.append(item)
@@ -388,6 +399,9 @@ def snapshot(c, private=False, voting=False):
         if not voting: result['event']['presentation']=presentation_config(c,e['id'],qs)
     if private:
         result['events']=[dict(x) for x in c.execute('SELECT e.id,e.title,e.question,e.created,coalesce(m.archived,0) archived,coalesce(m.template,0) template,(SELECT count(*) FROM rounds WHERE event_id=e.id) AS round_count,(SELECT count(*) FROM votes v JOIN rounds r ON r.id=v.round_id WHERE r.event_id=e.id AND v.question_index=0) AS total FROM events e LEFT JOIN event_meta m ON m.event_id=e.id ORDER BY e.id DESC')]
+        for item in result['events']:
+            ext=external_source(c,item['id'])
+            if ext: item.update(source='yandex',total=json.loads(ext['aggregate'])['total'])
     return result
 
 app=FastAPI(title='Votemera',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None)
@@ -450,6 +464,7 @@ def vote(v:Vote):
             if (old['round_id'],old['choice'],old['terminal']) != (v.round,v.choice,v.terminal): fail(409,'Конфликт идентификатора')
             return {'ok':True,'duplicate':True}
         s=c.execute('SELECT * FROM settings').fetchone()
+        if external_source(c,s['active_event']): fail(409,'Заполните Яндекс Форму')
         terminal_allowed(c,v.terminal,s['active_event'])
         if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Повторите выбор.')
         e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
@@ -484,6 +499,7 @@ def ballot(v:Ballot):
             if not e or not valid_ballot(questions(e),v.choices): fail(409,'Конфликт анкеты')
             return {'ok':True,'duplicate':True}
         s=c.execute('SELECT * FROM settings').fetchone()
+        if external_source(c,s['active_event']): fail(409,'Заполните Яндекс Форму')
         terminal_allowed(c,v.terminal,s['active_event'])
         if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Начните заново.')
         e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
@@ -606,12 +622,13 @@ def event_detail(eid:int):
     with db() as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
-        return dict(id=eid,title=e['title'],question=e['question'],options=json.loads(e['options']),questions=questions(e),meta=meta(c,eid),rounds=[dict(r) for r in c.execute('SELECT id,name FROM rounds WHERE event_id=? ORDER BY position',(eid,))])
+        return dict(source='yandex' if external_source(c,eid) else 'local',id=eid,title=e['title'],question=e['question'],options=json.loads(e['options']),questions=questions(e),meta=meta(c,eid),rounds=[dict(r) for r in c.execute('SELECT id,name FROM rounds WHERE event_id=? ORDER BY position',(eid,))])
 @app.put('/api/admin/event/{eid}',dependencies=[Depends(admin)])
 def edit_event(eid:int,e:Event):
     qs,names=validate_event(e)
     with db(True) as c:
         if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Не найдено')
+        if external_source(c,eid): fail(409,'Редактируйте структуру в Яндекс Формах и создайте новое подключение')
         s=c.execute('SELECT * FROM settings').fetchone()
         if (s['active_event']==eid and effective_open(c,s)) or c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Редактирование доступно только до начала голосования или после очистки всех этапов')
         c.execute('UPDATE events SET title=?,question=?,options=?,questions=? WHERE id=?',(clean(e.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),json.dumps(qs,ensure_ascii=False),eid))
@@ -626,6 +643,8 @@ def delete_event(eid:int,confirm_results:bool=False):
     with db(True) as c:
         if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Мероприятие не найдено')
         if c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]==eid: fail(409,'Сначала выберите другое активное мероприятие')
+        ext=external_source(c,eid)
+        if not confirm_results and ext and json.loads(ext['aggregate'])['total']: fail(409,'Подтвердите удаление результатов')
         if not confirm_results and c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Подтвердите удаление результатов')
         audit(c,'Удаление мероприятия',eid)
         c.execute('DELETE FROM events WHERE id=?',(eid,))
@@ -640,6 +659,7 @@ def control(v:Control):
     with db(True) as c:
         if not c.execute('SELECT 1 FROM events WHERE id=?',(v.event,)).fetchone(): fail(404,'Мероприятие не найдено')
         if meta(c,v.event)['archived']: fail(409,'Сначала восстановите мероприятие из архива')
+        if external_source(c,v.event) and (v.opened or v.display not in ('live','hidden','presentation')): fail(409,'Для Яндекс Форм используйте текущие результаты или скрытие; сбор ответов управляется в Яндексе')
         if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
         if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
         s=c.execute('SELECT * FROM settings').fetchone()
@@ -655,6 +675,7 @@ def set_analysis(eid:int,v:AnalysisConfig):
     with db(True) as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
+        if external_source(c,eid): fail(409,'Перекрёстный анализ для Яндекс Форм пока недоступен')
         if v.first==v.second or max(v.first,v.second)>=len(questions(e)): fail(422,'Выберите два разных вопроса')
         c.execute('INSERT INTO analysis_config VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET first_q=excluded.first_q,second_q=excluded.second_q,chart=excluded.chart',(eid,v.first,v.second,v.chart))
     return {'ok':True}
@@ -678,6 +699,7 @@ def clone_event(eid:int,prefix:str):
     with db(True) as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
+        if external_source(c,eid): fail(409,'Создайте отдельное подключение в разделе интеграций')
         new=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(prefix+e['title'][:120-len(prefix)],e['question'],e['options'],time.time(),e['questions'])).lastrowid
         ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(new,r['name'],r['position'])).lastrowid for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,)).fetchall()]
         for name,columns in [('analysis_config','first_q,second_q,chart'),('presentation_config','data'),('event_meta','brand,accent,logo')]:
@@ -696,6 +718,7 @@ def clear(rid:int):
         s=c.execute('SELECT * FROM settings').fetchone()
         if effective_open(c,s) and s['active_round']==rid: fail(409,'Сначала закройте этап')
         if not c.execute('SELECT 1 FROM rounds WHERE id=?',(rid,)).fetchone(): fail(404,'Этап не найден')
+        if external_round(c,rid): fail(409,'Ответы импортируются из Яндекс Форм; удаляйте их в Яндексе')
         audit(c,'Очистка голосов',rid)
         c.execute('DELETE FROM votes WHERE round_id=?',(rid,))
         if s['active_round']==rid: c.execute('UPDATE settings SET epoch=? WHERE id=1',(uuid4().hex,))
@@ -776,7 +799,7 @@ def restore_database(path):
                 source.execute('PRAGMA foreign_keys=ON')
                 # Previous backups may lack only the four additive v0.11 tables.
                 actual_schema=schema(source)
-                additions={'event_meta','runtime_config','terminal_config','audit_log'}
+                additions={'event_meta','runtime_config','terminal_config','audit_log','yandex_source'}
                 missing=expected_schema-actual_schema
                 if actual_schema-expected_schema or any(r[0]!='table' or r[1] not in additions for r in missing): fail(422,'Несовместимая схема базы')
                 for row in sorted(missing): source.execute(row[3])
@@ -793,6 +816,13 @@ def restore_database(path):
                     qs=questions(e)
                     if not 1<=len(qs)<=12: fail(422,'Некорректная анкета')
                     for q in qs: Question.model_validate(q)
+                    ext=external_source(source,e['id'])
+                    if ext:
+                        if not re.fullmatch(r'[a-f0-9]{24}',ext['form_id']): fail(422,'Неверный ID формы')
+                        ag=json.loads(ext['aggregate']); rr=ag['results']; spec=json.loads(ext['spec'])
+                        if len(rr)!=len(qs) or len(spec)!=len(qs) or type(ag['total']) is not int or ag['total']<0: fail(422,'Некорректная статистика формы')
+                        for q,r in zip(qs,rr):
+                            if len(r['counts'])!=len(q['options']) or type(r['total']) is not int or not 0<=r['total']<=ag['total'] or any(type(n) is not int or not 0<=n<=r['total'] for n in r['counts']): fail(422,'Некорректная статистика формы')
                     for r in source.execute('SELECT * FROM rounds WHERE event_id=?',(e['id'],)).fetchall():
                         for vote in source.execute('SELECT DISTINCT question_index,choice FROM votes WHERE round_id=?',(r['id'],)):
                             if not 0<=vote['question_index']<len(qs) or not 0<=vote['choice']<len(qs[vote['question_index']]['options']): fail(422,'Неверный индекс ответа')
@@ -939,5 +969,168 @@ def report(eid:int,fmt:Literal['pdf','xlsx']):
     try: data,media=make_report(e['title'],qs,rows,fmt)
     except FileNotFoundError: fail(503,'Для PDF установите fonts-dejavu-core на сервере')
     return Response(data,media_type=media,headers={'Content-Disposition':f'attachment; filename="votemera-{eid}.{fmt}"'})
+
+# Yandex Forms integration, read-only remote access and aggregate-only storage.
+import yandex_forms as yf
+YF_LOCK=threading.Lock()
+YF_DUE={}
+YF_STOP=threading.Event()
+
+class YandexCredentials(BaseModel):
+    org: str=Field(pattern=r'^\d{1,32}$')
+    token: str=Field(min_length=8,max_length=2048,pattern=r'^[!-~]+$')
+
+class YandexCreate(BaseModel):
+    form_id: str=Field(pattern=r'^[a-fA-F0-9]{24}$')
+    title: str=Field(min_length=1,max_length=120)
+    questions: list[int]=Field(min_length=1,max_length=12)
+    date_from: str=Field(default='',max_length=40)
+    date_to: str=Field(default='',max_length=40)
+    interval: int=Field(default=5,ge=5,le=3600)
+
+class YandexSettings(BaseModel):
+    interval: int=Field(ge=5,le=3600)
+    enabled: bool
+
+def yf_credentials():
+    with access_db() as c:
+        row=c.execute('SELECT * FROM yandex_credentials WHERE id=1').fetchone()
+        return dict(row) if row else None
+
+def yf_require():
+    creds=yf_credentials()
+    if not creds: fail(409,'Сначала подключите Яндекс Формы')
+    return creds
+
+def yf_call(fn,*args):
+    try:return fn(*args)
+    except yf.FormsError as exc: fail(502,str(exc))
+    except (KeyError,TypeError,ValueError):fail(502,'Неожиданный формат ответа Яндекс Форм')
+
+@app.get('/api/admin/yandex',dependencies=[Depends(admin)])
+def yf_status():
+    creds=yf_credentials()
+    with db() as c:
+        sources=[dict(event_id=r['event_id'],title=r['title'],form_id=r['form_id'],interval=r['interval'],enabled=bool(r['enabled']),last_sync=r['last_sync'],error=r['error'],total=json.loads(r['aggregate'])['total'],date_from=r['date_from'],date_to=r['date_to']) for r in c.execute('SELECT y.*,e.title FROM yandex_source y JOIN events e ON e.id=y.event_id ORDER BY e.id DESC')]
+    return {'connected':bool(creds),'org':creds['org'] if creds else '', 'sources':sources}
+
+@app.put('/api/admin/yandex',dependencies=[Depends(admin)])
+def yf_connect(v:YandexCredentials):
+    yf_call(yf.request,v.org,v.token,'/v1/users/me/')
+    with access_db(True) as c:
+        c.execute('INSERT OR REPLACE INTO yandex_credentials VALUES(1,?,?,?)',(v.org,v.token,uuid4().hex))
+    return {'ok':True}
+
+@app.delete('/api/admin/yandex',dependencies=[Depends(admin)])
+def yf_disconnect():
+    with access_db(True) as c:c.execute('DELETE FROM yandex_credentials')
+    with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,error='Подключение отключено'")
+    return {'ok':True}
+
+@app.get('/api/admin/yandex/forms',dependencies=[Depends(admin)])
+def yf_forms(search:str='',offset:int=0):
+    c=yf_require()
+    if not 0<=offset<=10000 or len(search)>120:fail(422,'Неверный фильтр')
+    return {'forms':yf_call(yf.list_forms,c['org'],c['token'],search,offset)}
+
+@app.get('/api/admin/yandex/forms/{sid}',dependencies=[Depends(admin)])
+def yf_questions(sid:str):
+    c=yf_require()
+    return {'questions':yf_call(yf.questions,c['org'],c['token'],sid)}
+
+@app.post('/api/admin/yandex/events',dependencies=[Depends(admin)])
+def yf_create(v:YandexCreate):
+    creds=yf_require()
+    start=yf_call(yf.validate_date,v.date_from);end=yf_call(yf.validate_date,v.date_to)
+    if start and end and yf.datetime.fromisoformat(start)>yf.datetime.fromisoformat(end): fail(422,'Начало периода позже окончания')
+    available={q['id']:q for q in yf_call(yf.questions,creds['org'],creds['token'],v.form_id)}
+    if len(set(v.questions))!=len(v.questions) or any(q not in available or not available[q]['supported'] for q in v.questions):fail(422,'Выберите поддерживаемые вопросы')
+    spec=[available[q] for q in v.questions]
+    qs=[{'question':q['label'],'options':q['options'],'description':'Множественный выбор: доля ответивших' if q['multi'] else '', 'confirm':False,'multi':q['multi']} for q in spec]
+    # Check response access before creating the event.
+    yf_call(yf.request,creds['org'],creds['token'],'/v1/surveys/'+v.form_id.lower()+'/answers',{'page_size':1,'questions':','.join(str(q) for q in v.questions)})
+    ag={'total':0,'results':[{'total':0,'counts':[0]*len(q['options'])} for q in qs]}
+    with db(True) as c:
+        eid=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(clean(v.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),time.time(),json.dumps(qs,ensure_ascii=False))).lastrowid
+        rid=c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,0)',(eid,'Ответы Яндекс Форм')).lastrowid
+        c.execute('INSERT INTO yandex_source VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(eid,creds['org'],v.form_id.lower(),json.dumps(spec,ensure_ascii=False),start,end,v.interval,uuid4().hex,json.dumps(ag),None,'',1))
+        audit(c,'Подключение Яндекс Формы',eid)
+    return {'id':eid,'round':rid}
+
+def yf_sync(eid):
+    if not YF_LOCK.acquire(blocking=False):return False
+    try:
+        with db() as c:
+            r=external_source(c,eid)
+            if not r:return False
+            row=dict(r)
+        creds=yf_credentials()
+        try:
+            if not creds or creds['org']!=row['org']:raise yf.FormsError('Нет подключения к организации формы')
+            ag=yf.aggregate(creds['org'],creds['token'],row['form_id'],json.loads(row['spec']),row['date_from'],row['date_to'])
+            error=''
+        except yf.FormsError as exc:ag=None;error=str(exc)
+        except Exception:ag=None;error='Неожиданный формат данных Яндекс Форм'
+        current=yf_credentials()
+        if (current or {}).get('revision')!=(creds or {}).get('revision'):return False
+        with db(True) as c:
+            if ag is None:
+                c.execute('UPDATE yandex_source SET error=? WHERE event_id=? AND revision=?',(error,eid,row['revision']))
+            else:
+                c.execute('UPDATE yandex_source SET aggregate=?,last_sync=?,error="" WHERE event_id=? AND revision=?',(json.dumps(ag),time.time(),eid,row['revision']))
+        YF_DUE[(str(DB),eid)]=time.monotonic()+max(row['interval'],60 if error else 0)
+        return ag is not None
+    finally:YF_LOCK.release()
+
+@app.put('/api/admin/yandex/events/{eid}',dependencies=[Depends(admin)])
+def yf_settings(eid:int,v:YandexSettings):
+    with db(True) as c:
+        if not c.execute('UPDATE yandex_source SET interval=?,enabled=?,revision=? WHERE event_id=?',(v.interval,int(v.enabled),uuid4().hex,eid)).rowcount:fail(404,'Подключение не найдено')
+    return {'ok':True}
+
+@app.post('/api/admin/yandex/events/{eid}/sync',dependencies=[Depends(admin)])
+def yf_manual(eid:int):
+    with db() as c:
+        if not external_source(c,eid):fail(404,'Подключение не найдено')
+    # The worker does network I/O; no long HTTP request or blocked SSE loop.
+    YF_DUE[(str(DB),eid)]=0
+    YF_MANUAL.add((str(DB),eid))
+    return {'queued':True}
+
+YF_MANUAL=set()
+def yf_worker():
+    while not YF_STOP.wait(1):
+        try:
+            with db() as c:
+                rows=[dict(r) for r in c.execute('SELECT y.event_id,y.enabled,y.interval FROM yandex_source y JOIN settings s ON s.active_event=y.event_id WHERE s.id=1')]
+            candidates={(str(DB),r['event_id']) for r in rows if r['enabled']} | set(YF_MANUAL)
+            for key in candidates:
+                if key[0]!=str(DB) or time.monotonic()<YF_DUE.get(key,0):continue
+                YF_MANUAL.discard(key)
+                yf_sync(key[1])
+            if len(YF_DUE)>1000:YF_DUE.clear()
+        except Exception:
+            YF_STOP.wait(5)
+
+@app.on_event('startup')
+def start_yandex_worker():
+    YF_STOP.clear()
+    threading.Thread(target=yf_worker,daemon=True,name='yandex-forms').start()
+
+@app.on_event('shutdown')
+def stop_yandex_worker():
+    YF_STOP.set()
+
+@app.get('/api/admin/yandex/events/{eid}/qr',dependencies=[Depends(admin)])
+def yf_qr(eid:int):
+    import qrcode
+    import qrcode.image.svg
+    with db() as c:
+        row=external_source(c,eid)
+        if not row:fail(404,'Подключение не найдено')
+        sid=yf_call(yf.form_id,row['form_id'])
+    out=io.BytesIO()
+    qrcode.make('https://forms.yandex.ru/cloud/u/'+sid+'/',image_factory=qrcode.image.svg.SvgPathImage).save(out)
+    return Response(out.getvalue(),media_type='image/svg+xml')
 
 init()
