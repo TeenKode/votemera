@@ -219,3 +219,21 @@ def test_terminal_monitor_and_idle_timeout(client):
     assert client.get('/api/state?view=vote').json()['settings']['idle_timeout']==15
     cfg['idle_timeout']=601
     assert client.put('/api/admin/settings',headers=AUTH,json=cfg).status_code==422
+
+def test_presentation_and_rehearsal(client):
+    s=multi(client);eid=s['event']['id']
+    send_ballot(client,s,[0,2])
+    config=dict(order=[1,0],slides=[{'mode':'compare','question':1},{'mode':'analysis'}],seconds=10)
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json=config).status_code==200
+    assert client.put(f'/api/admin/presentation/{eid}',headers=AUTH,json={**config,'order':[1,1]}).status_code==422
+    activate(client,display='presentation')
+    public=client.get('/api/state').json()['event']
+    assert public['presentation']['order']==[1,0]
+    assert all('results' in r and 'cross' in r for r in public['rounds'])
+    rehearsal=client.post(f'/api/admin/rehearsal/{eid}',headers=AUTH).json()
+    assert rehearsal['id']!=eid
+    copy=client.get(f'/api/admin/event/{rehearsal["id"]}',headers=AUTH).json()
+    assert copy['title'].startswith('[Репетиция]') and copy['questions']==s['event']['questions']
+    result=client.post('/api/admin/control',headers=AUTH,json=dict(event=rehearsal['id'],round=rehearsal['round'],opened=False,display='live')).json()
+    assert all(r['total']==0 for r in result['event']['rounds'])
+    assert result['event']['presentation']['order']==[1,0]
