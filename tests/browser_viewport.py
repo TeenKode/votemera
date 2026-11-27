@@ -59,6 +59,13 @@ with sync_playwright() as p:
     for w,h in SIZES:
         display.set_viewport_size({'width':w,'height':h})
         fits(display,'.cross-panel,.cross-group,.screen-pager button')
+    # A compact pair must still show before/after side by side on a large projector.
+    small=[{'label':'Да','color':'#16845b'},{'label':'Нет','color':'#df5363'}]
+    e=api.post(BASE+'/api/admin/event',headers=AUTH,data={'title':'Компактная пара','rounds':['До','После'],'questions':[{'question':'Первый','options':small},{'question':'Второй','options':small}]}).json()
+    display.set_viewport_size({'width':1920,'height':1080})
+    assert api.post(BASE+'/api/admin/control',headers=AUTH,data={'event':e['id'],'round':e['round'],'opened':False,'display':'analysis_compare'}).ok
+    expect(display.locator('.cross-panel')).to_have_count(2)
+    fits(display,'.cross-panel')
     assert not errors,errors
     browser.close()
     print('Public viewport fit: OK')

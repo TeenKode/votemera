@@ -105,7 +105,7 @@ body:is([data-mode=vote],[data-mode=display]) .screen-stage{position:relative;fl
 .screen-stage .delta-panel .delta{gap:5px}
 .screen-stage .cross-pair{padding:9px 14px;gap:12px}
 .screen-stage .cross-pair h2{font-size:clamp(17px,2.5vmin,30px)}
-.screen-stage .cross-rounds{grid-template-columns:minmax(0,1fr);gap:8px;margin-top:0}
+.screen-stage .cross-rounds{grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:8px;margin-top:0}
 .screen-stage .cross-panel{gap:8px}
 .screen-stage .cross-legend{gap:6px 12px}
 .screen-stage .cross-group{gap:4px}
@@ -126,3 +126,9 @@ body:is([data-mode=vote],[data-mode=display]) .screen-stage{position:relative;fl
 @media(min-width:900px){.screen-stage .vote-main{padding-inline:clamp(20px,5vw,100px)}.screen-stage .choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-height:650px){body:is([data-mode=vote],[data-mode=display]) .brand small{display:none}.screen-stage .vote-main{gap:8px}.screen-stage .choice{min-height:58px}.screen-stage .choice-list .choice{min-height:46px}.screen-stage .choices-2.choice-grid .choice{min-height:100px}.screen-stage .question-kicker{font-size:11px}}
 @media(max-width:600px){.screen-stage .choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.screen-stage .choice-index{display:none}.screen-stage .choice-indicator{font-size:20px}.screen-stage .cross-pair{gap:5px}.screen-stage .metric-values{gap:5px}.screen-stage .display-controls label{display:none}}
+
+/* Use the available working area, not just the natural height of a short card. */
+.screen-stage .vote-main>.choices{flex:1 0 auto;align-content:stretch;grid-auto-rows:1fr}
+.screen-stage .display-main>.question-single,.screen-stage .display-main>.question-grid,.screen-stage .display-main>.cross-rounds{flex:1 0 auto;align-content:stretch}
+.screen-stage .question-single{display:flex;flex-direction:column}
+.screen-stage .question-single>.question-group{flex:1 0 auto;justify-content:center}

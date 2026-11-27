@@ -148,8 +148,10 @@ function crossPanel(s,r){
 function renderCross(s){
  clearInterval(rotateTimer);const ac=s.event.analysis;
  const allRounds=s.display==='analysis_compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);
- const crossSize=1;const pages=Math.max(1,Math.ceil(allRounds.length/crossSize));
- const scope=JSON.stringify([s.event.id,s.display,s.round,ac,allRounds.map(r=>r.id)]);
+ const crossWidth=fitStage?.clientWidth||innerWidth,crossHeight=fitStage?.clientHeight||innerHeight;
+ const compactPair=ac&&s.event.questions[ac.first].options.length<=3&&s.event.questions[ac.second].options.length<=3&&[s.event.questions[ac.first],s.event.questions[ac.second]].every(q=>q.options.every(o=>o.label.length<=45));
+ const crossSize=compactPair&&crossWidth>=1100&&crossHeight>=600?2:1;const pages=Math.max(1,Math.ceil(allRounds.length/crossSize));
+ const scope=JSON.stringify([s.event.id,s.display,s.round,ac,allRounds.map(r=>r.id),crossSize,s.settings.display_rotate]);
  if(scope!==crossScope){crossScope=scope;crossPage=0;clearInterval(crossTimer);crossTimer=null}
  crossPage=Math.min(crossPage,pages-1);
  const rounds=allRounds.slice(crossPage*crossSize,(crossPage+1)*crossSize);
@@ -157,7 +159,7 @@ function renderCross(s){
  view.append(add(el('div','display-heading'),add(el('div'),el('div','eyebrow','Перекрёстный анализ · '+s.event.title),el('h1','','Связь ответов'))));
  if(!ac){main.dataset.sig=sig;main.className='display-main cross-main';main.replaceChildren(...view.children,el('p','muted','Для анализа необходимо не менее двух вопросов.'));return}
  const a=s.event.questions[ac.first],b=s.event.questions[ac.second];view.append(add(el('div','cross-pair'),add(el('div'),el('small','muted','ГРУППИРОВКА'),el('h2','',a.question)),el('span','cross-arrow','→'),add(el('div'),el('small','muted','РАСПРЕДЕЛЕНИЕ'),el('h2','',b.question))));
- if(pages>1){const nav=el('div','display-nav screen-pager');nav.append(btn('‹',()=>{crossPage=(crossPage+pages-1)%pages;renderDisplay()}),el('span','muted',`Этап ${crossPage+1} / ${pages}`),btn('›',()=>{crossPage=(crossPage+1)%pages;renderDisplay()}));view.append(nav);if(!crossTimer&&s.settings.display_rotate>0)crossTimer=setInterval(()=>{crossPage=(crossPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}
+ if(pages>1){const nav=el('div','display-nav screen-pager');nav.append(btn('‹',()=>{crossPage=(crossPage+pages-1)%pages;renderDisplay()}),el('span','muted',`Страница ${crossPage+1} / ${pages}`),btn('›',()=>{crossPage=(crossPage+1)%pages;renderDisplay()}));view.append(nav);if(!crossTimer&&s.settings.display_rotate>0)crossTimer=setInterval(()=>{crossPage=(crossPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}
  const wrap=el('div','cross-rounds');rounds.forEach(r=>wrap.append(crossPanel(s,r)));view.append(wrap);
  if(main.dataset.sig===sig&&main.children.length===view.children.length){[...view.children].forEach((n,i)=>patchView(main.children[i],n))}else{main.dataset.sig=sig;main.className='display-main cross-main';main.replaceChildren(...view.children)}
 }
