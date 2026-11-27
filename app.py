@@ -808,6 +808,7 @@ def restore_database(path):
                 if source.execute('SELECT count(*) FROM settings').fetchone()[0]!=1: fail(422,'Некорректные настройки')
                 source.execute('UPDATE settings SET opened=0,epoch=?,display=? WHERE id=1',(uuid4().hex,'hidden'))
                 source.execute('UPDATE runtime_config SET deadline=NULL WHERE id=1')
+                source.execute('UPDATE yandex_source SET enabled=0,revision=?,error=?',(uuid4().hex,'Восстановлено из резервной копии; включите синхронизацию'))
                 source.commit()
                 preview=snapshot(source,private=True)
                 if not preview['event'] or not any(r['id']==preview['round'] for r in preview['event']['rounds']): fail(422,'Нет корректного активного мероприятия')
@@ -1086,6 +1087,7 @@ def yf_sync(eid):
 def yf_settings(eid:int,v:YandexSettings):
     with db(True) as c:
         if not c.execute('UPDATE yandex_source SET interval=?,enabled=?,revision=? WHERE event_id=?',(v.interval,int(v.enabled),uuid4().hex,eid)).rowcount:fail(404,'Подключение не найдено')
+    YF_DUE[(str(DB),eid)]=0
     return {'ok':True}
 
 @app.post('/api/admin/yandex/events/{eid}/sync',dependencies=[Depends(admin)])
@@ -1094,19 +1096,21 @@ def yf_manual(eid:int):
         if not external_source(c,eid):fail(404,'Подключение не найдено')
     # The worker does network I/O; no long HTTP request or blocked SSE loop.
     YF_DUE[(str(DB),eid)]=0
-    YF_MANUAL.add((str(DB),eid))
+    with YF_QUEUE_LOCK: YF_MANUAL.add((str(DB),eid))
     return {'queued':True}
 
 YF_MANUAL=set()
+YF_QUEUE_LOCK=threading.Lock()
 def yf_worker():
     while not YF_STOP.wait(1):
         try:
             with db() as c:
                 rows=[dict(r) for r in c.execute('SELECT y.event_id,y.enabled,y.interval FROM yandex_source y JOIN settings s ON s.active_event=y.event_id WHERE s.id=1')]
-            candidates={(str(DB),r['event_id']) for r in rows if r['enabled']} | set(YF_MANUAL)
+            with YF_QUEUE_LOCK: manual=set(YF_MANUAL)
+            candidates={(str(DB),r['event_id']) for r in rows if r['enabled']} | manual
             for key in candidates:
                 if key[0]!=str(DB) or time.monotonic()<YF_DUE.get(key,0):continue
-                YF_MANUAL.discard(key)
+                with YF_QUEUE_LOCK: YF_MANUAL.discard(key)
                 yf_sync(key[1])
             if len(YF_DUE)>1000:YF_DUE.clear()
         except Exception:

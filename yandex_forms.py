@@ -43,9 +43,9 @@ def questions(org,token,sid):
             if not isinstance(q,dict) or q.get('hidden'):continue
             kind=q.get('type'); widget=q.get('widget',kind)
             items=q.get('items',[])
-            labels=[str(x.get('label','')).strip() for x in items if isinstance(x,dict)]
+            labels=[str(x.get('label','')) for x in items if isinstance(x,dict)]
             if kind=='boolean': labels=['Да','Нет']
-            supported=kind=='boolean' or (kind in ('enum','radio','checkbox','dropdown','stars','onerow') and 2<=len(labels)<=6 and len(set(labels))==len(labels) and all(0<len(x)<=80 for x in labels))
+            supported=kind=='boolean' or (kind in ('enum','radio','checkbox','dropdown','stars','onerow') and 2<=len(labels)<=6 and len(set(labels))==len(labels) and all(0<len(x)<=80 and x.strip() for x in labels))
             result.append({'id':int(q['id']),'label':str(q.get('label') or 'Вопрос')[:300],'kind':kind,'multi':widget=='checkbox' and not any(v.get('type')=='single' for v in q.get('validators',[]) if isinstance(v,dict)),'supported':supported,'options':[{'label':x,'color':COLORS[i]} for i,x in enumerate(labels)] if supported else []})
     return result
 def validate_date(value):
