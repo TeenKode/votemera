@@ -8,6 +8,9 @@ import os
 import re
 import sqlite3
 import time
+import subprocess
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -23,6 +26,11 @@ VERSION = (ROOT / 'VERSION').read_text().strip()
 DB = Path(os.getenv('VOTEMERA_DB', str(ROOT / 'data' / 'votemera.db')))
 ADMIN = os.getenv('VOTEMERA_ADMIN_PASSWORD', '')
 TERMINAL = os.getenv('VOTEMERA_TERMINAL_KEY', '')
+UPDATE_STATUS = Path('/var/lib/votemera-update/status')
+UPDATE_REQUEST = Path('/var/lib/votemera/update-request')
+UPDATE_REMOTE = 'https://github.com/TeenKode/votemera.git'
+AUTH_FAILURES = OrderedDict()
+AUTH_LOCK = threading.Lock()
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
 DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full')
 
@@ -76,9 +84,20 @@ def init():
 
 def fail(status,msg): raise HTTPException(status,msg)
 def secret_eq(a,b): return hmac.compare_digest(a.encode(),b.encode())
-def admin(authorization: str = Header(default='')):
+def admin(request: Request, authorization: str = Header(default='')):
     if not ADMIN: fail(503,'Пароль администратора не настроен на сервере')
-    if not secret_eq(authorization,'Bearer '+ADMIN): fail(401,'Неверный пароль')
+    address=request.client.host if request.client else 'unknown'
+    now=time.monotonic()
+    with AUTH_LOCK:
+        n,until=AUTH_FAILURES.get(address,(0,0))
+        if until<=now: n=0; until=now+60
+        if n>=10: fail(429,'Слишком много попыток входа. Повторите через минуту.')
+        if not secret_eq(authorization,'Bearer '+ADMIN):
+            AUTH_FAILURES[address]=(n+1,until)
+            AUTH_FAILURES.move_to_end(address)
+            while len(AUTH_FAILURES)>4096: AUTH_FAILURES.popitem(last=False)
+            fail(401,'Неверный пароль')
+        AUTH_FAILURES.pop(address,None)
 def terminal(x_terminal_key: str = Header(default='')):
     if TERMINAL and not secret_eq(x_terminal_key,TERMINAL): fail(403,'Неверный ключ терминала')
 
@@ -310,6 +329,7 @@ def edit_event(eid:int,e:Event):
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
     with db(True) as c:
+        if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
         if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
         s=c.execute('SELECT * FROM settings').fetchone()
         epoch=uuid4().hex if (s['active_event'],s['active_round'],bool(s['opened']))!=(v.event,v.round,v.opened) else s['epoch']
@@ -351,5 +371,69 @@ def export(eid:int):
                 for o,n in zip(q['options'],res['counts']):
                     w.writerow([safe(e['title']),safe(q['question']),safe(r['name']),safe(o['label']),n,f'{n*100/total if total else 0:.2f}'.replace('.',','),total])
     return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="votemera-{eid}.csv"'})
+
+def update_status():
+    try:
+        return UPDATE_STATUS.read_text().strip()
+    except OSError:
+        return 'unavailable'
+
+def update_busy():
+    return UPDATE_REQUEST.exists() or update_status()=='running'
+
+@app.get('/api/admin/update',dependencies=[Depends(admin)])
+def update_info(check: bool=False):
+    status=update_status()
+    info=dict(version=VERSION,status='queued' if UPDATE_REQUEST.exists() else status,available=None,latest=None)
+    if check and status!='unavailable' and not update_busy():
+        try:
+            local=subprocess.check_output(['git','-c',f'safe.directory={ROOT}','-C',str(ROOT),'rev-parse','HEAD'],text=True,timeout=5).strip()
+            remote=subprocess.check_output(['git','ls-remote',UPDATE_REMOTE,'refs/heads/main'],text=True,timeout=12).split()
+            if not remote or not re.fullmatch(r'[a-f0-9]{40}',remote[0]): raise ValueError('Invalid remote ref')
+            info.update(available=local!=remote[0],latest=remote[0][:10])
+        except (OSError,subprocess.SubprocessError,ValueError):
+            info['error']='Не удалось проверить GitHub. Проверьте подключение к интернету.'
+    return info
+
+@app.post('/api/admin/update',dependencies=[Depends(admin)])
+def request_update():
+    with db(True) as c:
+        if update_status()=='unavailable': fail(503,'Модуль обновления не установлен. Запустите scripts/install.sh.')
+        if c.execute('SELECT opened FROM settings WHERE id=1').fetchone()[0]: fail(409,'Сначала закройте голосование')
+        if update_busy(): fail(409,'Обновление уже запущено')
+        try:
+            fd=os.open(UPDATE_REQUEST,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+            os.close(fd)
+        except FileExistsError: fail(409,'Обновление уже запущено')
+        except OSError: fail(503,'Служба обновления недоступна')
+    return {'ok':True}
+
+@app.get('/api/admin/backup',dependencies=[Depends(admin)])
+def backup_database():
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        target=Path(directory)/'backup.db'
+        with db(transaction=False) as source, sqlite3.connect(target) as dest:
+            source.backup(dest)
+        data=target.read_bytes()
+    return Response(data,media_type='application/x-sqlite3',headers={'Content-Disposition':'attachment; filename="votemera-backup.db"'})
+
+@app.get('/api/admin/cross-export/{eid}',dependencies=[Depends(admin)])
+def cross_export(eid:int):
+    def safe(s): return "'"+s if s.lstrip().startswith(('=','+','-','@','\t','\r','\n')) else s
+    with db() as c:
+        e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+        if not e: fail(404,'Мероприятие не найдено')
+        qs=questions(e); ac=analysis_config(c,eid,qs)
+        if not ac: fail(422,'Нужно минимум два вопроса')
+        a,b=qs[ac['first']],qs[ac['second']]
+        out=io.StringIO(); w=csv.writer(out,delimiter=';')
+        w.writerow(['Этап','Вопрос группы','Группа','Вопрос распределения','Ответ','Количество','Доля внутри группы (%)','Размер группы'])
+        for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,)):
+            d=cross_results(c,r['id'],qs,ac['first'],ac['second'])
+            for i,row in enumerate(d['matrix']):
+                for j,n in enumerate(row):
+                    w.writerow([safe(r['name']),safe(a['question']),safe(a['options'][i]['label']),safe(b['question']),safe(b['options'][j]['label']),n,f"{n*100/d['totals'][i] if d['totals'][i] else 0:.2f}",d['totals'][i]])
+    return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="votemera-cross-{eid}.csv"'})
 
 init()
