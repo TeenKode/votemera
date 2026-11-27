@@ -21,10 +21,13 @@ def publish_status(data):
     finally:
         if os.path.exists(tmp):os.unlink(tmp)
 
-def copy_db(source,dest):
+def copy_db(source,dest, *, access=False):
     with closing(sqlite3.connect(f'file:{source}?mode=ro',uri=True,timeout=30)) as src, closing(sqlite3.connect(dest)) as target:
         src.execute('PRAGMA trusted_schema=OFF')
         src.backup(target)
+        if access and target.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='access_sessions'").fetchone():
+            target.execute('DELETE FROM access_sessions')
+            target.commit()
         if target.execute('PRAGMA quick_check').fetchone()[0]!='ok':raise RuntimeError('Backup integrity check failed')
     os.chmod(dest,0o600)
 
@@ -38,7 +41,7 @@ def main():
     tmp=Path(tempfile.mkdtemp(prefix='.pending-',dir=BASE))
     try:
         copy_db(DB,tmp/'votemera.db')
-        copy_db(DB.with_name(DB.name+'.access'),tmp/'votemera.db.access')
+        copy_db(DB.with_name(DB.name+'.access'),tmp/'votemera.db.access',access=True)
         shutil.copyfile('/etc/votemera/server.env',tmp/'server.env')
         os.chmod(tmp/'server.env',0o600)
         target=BASE/name

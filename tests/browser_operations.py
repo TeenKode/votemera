@@ -2,9 +2,8 @@
 import os
 from playwright.sync_api import sync_playwright,expect
 BASE=os.getenv('BASE_URL','http://127.0.0.1:8765')
-AUTH={'Authorization':'Bearer new-password-123'}
 with sync_playwright() as p:
-    browser=p.chromium.launch(args=['--no-sandbox'])
+    browser=p.chromium.launch(executable_path=os.getenv('CHROMIUM') or None,args=['--no-sandbox'])
     admin=browser.new_page(viewport={'width':1366,'height':768})
     presenter=browser.new_page(viewport={'width':390,'height':844})
     errors=[]
@@ -29,7 +28,7 @@ with sync_playwright() as p:
     expect(presenter.get_by_text('Голосование открыто',exact=True)).to_be_visible()
     expect(admin.get_by_text('Сейчас голосование открыто',exact=True)).to_be_visible()
     presenter.get_by_role('button',name='Скрыть результаты').click()
-    assert presenter.request.get(BASE+'/api/admin/state',headers=AUTH).json()['display']=='hidden'
+    assert presenter.request.get(BASE+'/api/admin/state').json()['display']=='hidden'
     presenter.get_by_role('button',name='Закрыть этап').click()
     expect(presenter.get_by_text('Голосование закрыто',exact=True)).to_be_visible()
     expect(admin.get_by_text('Сейчас голосование закрыто',exact=True)).to_be_visible()

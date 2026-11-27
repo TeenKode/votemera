@@ -13,22 +13,61 @@ os.environ['VOTEMERA_ADMIN_PASSWORD']='test-secret'
 os.environ['VOTEMERA_TERMINAL_KEY']='test-key'
 import app as a
 
-AUTH={'Authorization':'Bearer test-secret'}
+AUTH={}
 KEY={'X-Terminal-Key':'test-key'}
+
+def admin_headers(c, password='test-secret'):
+    response = c.post('/api/admin/login', json={'password': password})
+    assert response.is_success, response.text
+    c.cookies.clear()
+    return {'Cookie': a.sessions.COOKIE + '=' + response.cookies[a.sessions.COOKIE]}
+
+def device_headers(c, v):
+    device = v['terminal']
+    with c.test_key_lock:
+        if device not in c.test_keys:
+            response = c.post('/api/admin/keys', headers=AUTH, json={'label': device})
+            assert response.is_success, response.text
+            c.test_keys[device] = {'X-Terminal-Key': response.json()['key']}
+        return c.test_keys[device]
+
 @pytest.fixture
 def client(tmp_path,monkeypatch):
     monkeypatch.setattr(a,'DB',tmp_path/'test.db'); a.init()
-    return TestClient(a.app)
+    c = TestClient(a.app)
+    a.AUTH_FAILURES.clear()
+    AUTH.clear()
+    AUTH.update(admin_headers(c))
+    c.test_keys = {}
+    c.test_key_lock = threading.Lock()
+    return c
 def activate(c,opened=True,display='live',idx=0):
     s=c.get('/api/admin/state',headers=AUTH).json(); e=s['event']; r=e['rounds'][idx]
-    return c.post('/api/admin/control',headers=AUTH,json=dict(event=e['id'],round=r['id'],opened=opened,display=display)).json()
+    assert c.post('/api/admin/control',headers=AUTH,json=dict(event=e['id'],round=r['id'],opened=opened,display=display)).is_success
+    return c.get('/api/admin/live',headers=AUTH).json()
 def payload(s,choice=0,terminal=None):
     return dict(round=s['round'],epoch=s['epoch'],choice=choice,nonce=uuid.uuid4().hex,terminal=terminal or uuid.uuid4().hex)
-def submit(c,v):return c.post('/api/vote',json=v,headers=KEY)
+def submit(c,v):return c.post('/api/vote',json=v,headers=device_headers(c,v))
+def submit_ballot(c,v):return c.post('/api/ballot',json=v,headers=device_headers(c,v))
 def test_auth(client):
     assert client.get('/api/admin/state').status_code==401
     assert client.post('/api/vote',json=payload(activate(client))).status_code==403
     assert client.get('/health').json()['status']=='ok'
+
+def test_admin_session_security(client):
+    assert client.get('/api/admin/state',headers={'Authorization':'Bearer test-secret'}).status_code==401
+    with TestClient(a.app, base_url='https://testserver') as https:
+        login = https.post('/api/admin/login', json={'password':'test-secret'})
+        assert login.is_success
+        cookie = login.headers['set-cookie']
+        assert 'Secure' in cookie and 'HttpOnly' in cookie and 'SameSite=strict' in cookie
+        assert https.get('/api/admin/state').is_success
+        assert https.patch('/api/admin/live', json={'display':'hidden'}, headers={'Origin':'https://another.example'}).status_code==403
+        assert https.post('/api/admin/logout', headers={'Origin':'https://testserver'}).is_success
+        assert https.get('/api/admin/state').status_code==401
+    with a.access_db(True) as c:
+        c.execute('UPDATE access_sessions SET expires=0')
+    assert client.get('/api/admin/state', headers=AUTH).status_code==401
 def test_votes_idempotent_cooldown(client):
     s=activate(client); v=payload(s)
     assert submit(client,v).status_code==200
@@ -81,13 +120,14 @@ def multi(c):
     r=c.post('/api/admin/event',headers=AUTH,json={'title':'Анкета','rounds':['До','После'],'questions':qs})
     assert r.status_code==200
     data=r.json()
-    return c.post('/api/admin/control',headers=AUTH,json={'event':data['id'],'round':data['round'],'opened':True,'display':'live'}).json()
+    assert c.post('/api/admin/control',headers=AUTH,json={'event':data['id'],'round':data['round'],'opened':True,'display':'live'}).is_success
+    return c.get('/api/admin/live',headers=AUTH).json()
 
 def test_multi_ballot(client):
     s=multi(client); v=payload(s);v.pop('choice');v['choices']=[0,2]
-    assert client.post('/api/ballot',headers=KEY,json=v).status_code==200
-    assert client.post('/api/ballot',headers=KEY,json=v).json()['duplicate']
-    assert client.post('/api/ballot',headers=KEY,json={**v,'choices':[1,2]}).status_code==409
+    assert submit_ballot(client,v).status_code==200
+    assert submit_ballot(client,v).json()['duplicate']
+    assert submit_ballot(client,{**v,'choices':[1,2]}).status_code==409
     assert submit(client,payload(s)).status_code==409
     r=client.get('/api/state').json()['event']['rounds'][0]
     assert r['results']==[{'counts':[1,0],'total':1},{'counts':[0,0,1],'total':1}]
@@ -96,17 +136,17 @@ def test_multi_ballot(client):
 
 def test_multi_invalid_atomic_and_stale(client):
     s=multi(client); v=payload(s);v.pop('choice');v['choices']=[0,4]
-    assert client.post('/api/ballot',headers=KEY,json=v).status_code==422
+    assert submit_ballot(client,v).status_code==422
     assert client.get('/api/state').json()['event']['rounds'][0]['total']==0
-    assert client.post('/api/ballot',headers=KEY,json={**v,'choices':[0]}).status_code==422
+    assert submit_ballot(client,{**v,'choices':[0]}).status_code==422
     activate(client,idx=1)
-    assert client.post('/api/ballot',headers=KEY,json={**v,'choices':[0,1]}).status_code==409
+    assert submit_ballot(client,{**v,'choices':[0,1]}).status_code==409
 
 def test_multi_concurrent(client):
     s=multi(client)
     def go(i):
         v=payload(s);v.pop('choice');v['choices']=[i%2,i%3]
-        return client.post('/api/ballot',headers=KEY,json=v).status_code
+        return submit_ballot(client,v).status_code
     with ThreadPoolExecutor(max_workers=12) as ex: assert list(ex.map(go,range(40)))==[200]*40
     assert client.get('/api/state').json()['event']['rounds'][0]['results']==[{'counts':[20,20],'total':40},{'counts':[14,13,13],'total':40}]
 
@@ -121,7 +161,7 @@ def test_migrate_legacy(client,monkeypatch,tmp_path):
 
 def send_ballot(c,s,choices):
     v=payload(s);v.pop('choice');v['choices']=choices
-    assert c.post('/api/ballot',headers=KEY,json=v).status_code==200
+    assert submit_ballot(c,v).status_code==200
     return v
 
 def test_cross_exact_pairs_and_visibility(client):
@@ -150,7 +190,7 @@ def test_cross_migrate_exact_ballot_nonces(client):
     s=multi(client)
     send_ballot(client,s,[0,2]);send_ballot(client,s,[1,1])
     with a.db(True) as c:
-        c.execute('DROP INDEX votes_ballot');c.execute('ALTER TABLE votes DROP COLUMN ballot_id')
+        c.execute('PRAGMA user_version=0');c.execute('DROP INDEX votes_ballot');c.execute('ALTER TABLE votes DROP COLUMN ballot_id')
         # Same terminal/time is not enough to match a deliberately corrupted old nonce.
         c.execute('UPDATE votes SET nonce=? WHERE question_index=1 AND choice=1',(uuid.uuid4().hex,))
     a.init();a.init();activate(client,display='analysis')
@@ -202,15 +242,17 @@ def test_cross_export(client):
 def test_admin_rate_limit(client):
     a.AUTH_FAILURES.clear()
     try:
-        for i in range(10): assert client.get('/api/admin/state').status_code==401
-        assert client.get('/api/admin/state').status_code==429
+        for i in range(10): assert client.post('/api/admin/login',json={'password':'wrong'}).status_code==401
+        assert client.post('/api/admin/login',json={'password':'test-secret'}).status_code==429
     finally: a.AUTH_FAILURES.clear()
 
 def test_terminal_monitor_and_idle_timeout(client):
     a.TERMINALS.clear()
     t=uuid.uuid4().hex
     assert client.post('/api/terminal/heartbeat',json={'terminal':t}).status_code==403
-    assert client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':t}).status_code==200
+    hb = client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':t})
+    assert hb.status_code==200
+    t = hb.json()['device_id']
     assert client.get('/api/admin/terminals').status_code==401
     r=client.get('/api/admin/terminals',headers=AUTH).json()
     assert r['online']==1 and r['terminals'][0]['id']==t[-8:]
@@ -238,7 +280,10 @@ def test_presentation_and_rehearsal(client):
     assert rehearsal['id']!=eid
     copy=client.get(f'/api/admin/event/{rehearsal["id"]}',headers=AUTH).json()
     assert copy['title'].startswith('[Репетиция]') and copy['questions']==s['event']['questions']
-    result=client.post('/api/admin/control',headers=AUTH,json=dict(event=rehearsal['id'],round=rehearsal['round'],opened=False,display='live')).json()
+    control=client.post('/api/admin/control',headers=AUTH,json=dict(event=rehearsal['id'],round=rehearsal['round'],opened=False,display='live')).json()
+    assert set(control)=={'event_id','round','opened','display','deadline','epoch'}
+    result=client.get('/api/admin/live',headers=AUTH).json()
+    assert 'events' not in result
     assert all(r['total']==0 for r in result['event']['rounds'])
     assert result['event']['presentation']['order']==[1,0]
 
@@ -251,11 +296,11 @@ def test_conditional_questions(client):
     eid=client.post('/api/admin/event',headers=AUTH,json=d).json()
     s=client.post('/api/admin/control',headers=AUTH,json=dict(event=eid['id'],round=eid['round'],opened=True,display='live')).json()
     v=send_ballot(client,s,[0,None,1])
-    assert client.post('/api/ballot',headers=KEY,json=v).json()['duplicate']
-    assert client.post('/api/ballot',headers=KEY,json={**v,'choices':[0,0,1]}).status_code==409
+    assert submit_ballot(client,v).json()['duplicate']
+    assert submit_ballot(client,{**v,'choices':[0,0,1]}).status_code==409
     send_ballot(client,s,[1,0,1])
     invalid={**payload(s),'choices':[1,None,0]};invalid.pop('choice')
-    assert client.post('/api/ballot',headers=KEY,json=invalid).status_code==422
+    assert submit_ballot(client,invalid).status_code==422
     r=client.get('/api/state').json()['event']['rounds'][0]
     assert r['total']==2 and r['results'][1]['total']==1
     activate(client,display='analysis')
@@ -283,8 +328,10 @@ def test_password_and_key_manager(client):
     initial=client.get('/api/admin/keys',headers=AUTH).json()
     assert initial['required'] and len(initial['keys'])==1 and 'digest' not in initial['keys'][0]
     assert client.put('/api/admin/password',headers=AUTH,json={'current':'wrong','password':'new-password'}).status_code==403
-    assert client.put('/api/admin/password',headers=AUTH,json={'current':'test-secret','password':'new-password'}).is_success
-    newauth={'Authorization':'Bearer new-password'}
+    changed = client.put('/api/admin/password',headers=AUTH,json={'current':'test-secret','password':'new-password'})
+    assert changed.is_success
+    newauth = {'Cookie': a.sessions.COOKIE + '=' + changed.cookies[a.sessions.COOKIE]}
+    client.cookies.clear()
     assert client.get('/api/admin/state',headers=AUTH).status_code==401
     assert client.get('/api/admin/state',headers=newauth).is_success
     a.init()
@@ -353,13 +400,15 @@ def test_display_change_at_deadline_keeps_voting_closed(client, monkeypatch):
     assert submit(client, payload(timed)).status_code == 409
 
 def test_terminal_controls(client):
-    s=activate(client);tid=uuid.uuid4().hex
+    s=activate(client);browser_id=uuid.uuid4().hex
+    tid = client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':browser_id}).json()['device_id']
     assert client.put('/api/admin/terminal/'+tid,headers=AUTH,json={'label':'Зал','locked':True,'reload':True}).is_success
-    hb=client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':tid}).json()
-    assert hb['locked'] and hb['revision']==1 and hb['label']=='Зал'
-    assert submit(client,payload(s,terminal=tid)).status_code==423
+    hb=client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':uuid.uuid4().hex}).json()
+    assert hb['device_id']==tid and hb['locked'] and hb['revision']==1 and hb['label']=='Зал'
+    assert client.post('/api/vote',headers=KEY,json=payload(s,terminal=browser_id)).status_code==423
     assert client.put('/api/admin/terminal/'+tid,headers=AUTH,json={'label':'Зал','locked':False}).is_success
-    assert submit(client,payload(s,terminal=tid)).is_success
+    assert client.post('/api/vote',headers=KEY,json=payload(s,terminal=browser_id)).is_success
+    assert client.post('/api/vote',headers=KEY,json=payload(s)).status_code==429
     item=next(r for r in client.get('/api/admin/terminals',headers=AUTH).json()['terminals'] if r['device_id']==tid)
     assert item['label']=='Зал' and not item['locked']
 
@@ -471,7 +520,6 @@ def yandex_event(client, monkeypatch):
         return {}
 
     monkeypatch.setattr(a.yf, 'request', request)
-    monkeypatch.setattr(a, 'YF_MANUAL', set())
     monkeypatch.setattr(a, 'YF_DUE', {})
     assert client.put('/api/admin/yandex', headers=AUTH, json={'org': '123', 'token': 'mock-token'}).is_success
     response = client.post('/api/admin/yandex/events', headers=AUTH, json={
@@ -522,6 +570,41 @@ def test_yandex_manual_request_during_sync(client, monkeypatch, yandex_event):
     a.yf_sync_pending(threading.Event())
     assert calls == [1, 2]
     assert client.get('/api/admin/yandex', headers=AUTH).json()['sources'][0]['total'] == 2
+
+
+def test_yandex_recovers_in_progress_job(client, monkeypatch, yandex_event):
+    eid = yandex_event['id']
+    assert client.post(f'/api/admin/yandex/events/{eid}/sync', headers=AUTH).is_success
+    with a.db(True) as c:
+        c.execute("UPDATE yandex_sync_jobs SET state='running' WHERE event_id=?", (eid,))
+    a.init()
+    monkeypatch.setattr(a.yf, 'aggregate', lambda *args: {'total':1,'results':[{'total':1,'counts':[1,0]}]})
+    a.yf_sync_pending(threading.Event())
+    source = client.get('/api/admin/yandex', headers=AUTH).json()['sources'][0]
+    assert source['sync_state']=='success' and source['total']==1
+
+
+def test_console_checks_full_backup_from_previous_release(client, tmp_path):
+    import sqlite3
+    import subprocess
+    from contextlib import closing
+
+    backup = tmp_path/'archive'
+    backup.mkdir()
+    (backup/'votemera.db').write_bytes(client.get('/api/admin/backup', headers=AUTH).content)
+    with closing(sqlite3.connect(backup/'votemera.db')) as c, c:
+        c.execute('DROP TABLE yandex_sync_jobs')
+        c.execute('PRAGMA user_version=0')
+    with a.access_db() as src, closing(sqlite3.connect(backup/'votemera.db.access')) as dst, dst:
+        src.backup(dst)
+        dst.execute('DROP TABLE access_sessions')
+        dst.execute('DROP INDEX terminal_keys_device')
+        dst.execute('ALTER TABLE terminal_keys DROP COLUMN device_id')
+        dst.execute('PRAGMA user_version=0')
+    (backup/'server.env').write_text('VOTEMERA_DB=/var/lib/votemera/votemera.db\nVOTEMERA_HOST=127.0.0.1\nVOTEMERA_PORT=8080\n')
+    checked = subprocess.run(['bash','scripts/restore-backup.sh','--check',str(backup)], capture_output=True, text=True)
+    assert checked.returncode==0, checked.stderr
+    assert client.post('/api/admin/restore', headers=AUTH, content=(backup/'votemera.db').read_bytes()).is_success
 
 
 def test_yandex_invalid_period_returns_validation_error(client, yandex_event):

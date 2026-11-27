@@ -3,7 +3,7 @@ import os
 from playwright.sync_api import sync_playwright, expect
 BASE=os.getenv('DEMO_URL','http://127.0.0.1:8766/')
 with sync_playwright() as p:
-    browser=p.chromium.launch(args=['--no-sandbox'])
+    browser=p.chromium.launch(executable_path=os.getenv('CHROMIUM') or None,args=['--no-sandbox'])
     context=browser.new_context()
     failures=[]
     context.on('request',lambda r: failures.append(r.url) if '/api/' in r.url or not r.url.startswith(BASE) else None)

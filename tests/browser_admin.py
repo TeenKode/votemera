@@ -3,7 +3,7 @@ import os
 from playwright.sync_api import sync_playwright,expect
 BASE=os.getenv('BASE_URL','http://127.0.0.1:8765')
 with sync_playwright() as p:
-    b=p.chromium.launch(args=['--no-sandbox'])
+    b=p.chromium.launch(executable_path=os.getenv('CHROMIUM') or None,args=['--no-sandbox'])
     a=b.new_page(viewport={'width':1366,'height':768})
     errors=[]
     a.on('pageerror',lambda e:errors.append(str(e)))
@@ -38,8 +38,11 @@ with sync_playwright() as p:
     expect(a.get_by_text('Пароль изменён',exact=True)).to_be_visible()
     a.reload()
     expect(a.get_by_role('heading',name='Смена пароля администратора')).to_be_visible()
-    assert a.request.get(BASE+'/api/admin/state',headers={'Authorization':'Bearer test-secret'}).status==401
-    assert a.request.get(BASE+'/api/admin/state',headers={'Authorization':'Bearer new-password-123'}).ok
+    assert a.request.get(BASE+'/api/admin/state').ok
+    anon=p.request.new_context()
+    assert anon.post(BASE+'/api/admin/login',data={'password':'test-secret'}).status==401
+    assert anon.post(BASE+'/api/admin/login',data={'password':'new-password-123'}).ok
+    anon.dispose()
     assert not errors,errors
     b.close()
     print('Admin management: OK')
