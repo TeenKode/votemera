@@ -4,9 +4,10 @@ set -euo pipefail
 cd /opt/votemera
 [[ -d .git ]] || { echo 'Обновление требует Git-клона в /opt/votemera'; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo 'Рабочее дерево изменено; обновление отменено'; exit 1; }
-old=$(git rev-parse HEAD)
 exec 9>/run/lock/votemera-update.lock
 flock -n 9 || { echo 'Обновление уже выполняется'; exit 1; }
+old=$(git rev-parse HEAD)
+[[ $(sqlite3 /var/lib/votemera/votemera.db "SELECT opened AND (deadline IS NULL OR deadline>CAST(strftime('%s','now') AS INTEGER)) FROM settings CROSS JOIN runtime_config WHERE settings.id=1 AND runtime_config.id=1;") == 0 ]] || { echo 'Сначала закройте голосование'; exit 1; }
 version=$(cat VERSION)
 tag=$(.venv/bin/python release_target.py "$version")
 [[ "$tag" != current ]] || { echo 'Стабильная версия актуальна'; exit 0; }
@@ -32,7 +33,7 @@ if [[ -f /var/lib/votemera/votemera.db.access ]]; then
 fi
 if git merge --ff-only "$target" && .venv/bin/pip install -r requirements.txt && systemctl start votemera; then
   port=$(sed -n 's/^VOTEMERA_PORT=//p' /etc/votemera/server.env)
-  for i in {1..15}; do if curl -fsS "http://127.0.0.1:$port/health" | .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" and d.get("version")==sys.argv[1] else 1)' "${tag#v}"; then bash scripts/install-backup.sh; echo 'Обновление завершено'; exit 0; fi; sleep 1; done
+  for i in {1..15}; do if curl -fsS "http://127.0.0.1:$port/health" | .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="ok" and d.get("version")==sys.argv[1] else 1)' "${tag#v}"; then if ! bash scripts/install-backup.sh; then echo 'Не удалось зарегистрировать таймер бэкапов; повторите установку таймера' >&2; fi; echo 'Обновление завершено'; exit 0; fi; sleep 1; done
 fi
 echo 'Ошибка обновления, откат к предыдущему коммиту и БД' >&2
 systemctl stop votemera || true

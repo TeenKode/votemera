@@ -315,3 +315,56 @@ def test_event_management(client):
     assert client.get(f'/api/admin/event/{eid}',headers=AUTH).status_code==404
     events=client.get('/api/admin/state',headers=AUTH).json()['events']
     assert len(events)==1 and events[0]['total']==0
+
+def test_timer_and_live_control(client,monkeypatch):
+    s=activate(client)
+    v=dict(event=s['event']['id'],round=s['round'],opened=True,display='live',duration=60)
+    assert client.post('/api/admin/control',headers=AUTH,json=v).is_success
+    timed=client.get('/api/admin/state',headers=AUTH).json()
+    assert timed['deadline']>a.time.time()
+    assert client.patch('/api/admin/live',headers=AUTH,json={'display':'hidden'}).is_success
+    assert client.get('/api/admin/state',headers=AUTH).json()['deadline']==timed['deadline']
+    with a.db(True) as c:c.execute('UPDATE runtime_config SET deadline=0 WHERE id=1')
+    assert not client.get('/api/state').json()['opened']
+    assert submit(client,payload(timed)).status_code==409
+    reopened=client.patch('/api/admin/live',headers=AUTH,json={'opened':True,'duration':0}).json()
+    assert reopened['opened'] and reopened['deadline'] is None and reopened['epoch']!=timed['epoch']
+
+def test_terminal_controls(client):
+    s=activate(client);tid=uuid.uuid4().hex
+    assert client.put('/api/admin/terminal/'+tid,headers=AUTH,json={'label':'Зал','locked':True,'reload':True}).is_success
+    hb=client.post('/api/terminal/heartbeat',headers=KEY,json={'terminal':tid}).json()
+    assert hb['locked'] and hb['revision']==1 and hb['label']=='Зал'
+    assert submit(client,payload(s,terminal=tid)).status_code==423
+    assert client.put('/api/admin/terminal/'+tid,headers=AUTH,json={'label':'Зал','locked':False}).is_success
+    assert submit(client,payload(s,terminal=tid)).is_success
+    item=next(r for r in client.get('/api/admin/terminals',headers=AUTH).json()['terminals'] if r['device_id']==tid)
+    assert item['label']=='Зал' and not item['locked']
+
+def test_archive_reports_qr_and_audit(client):
+    s=activate(client)
+    e=s['event']['id']
+    assert submit(client,payload(s)).is_success
+    assert client.put(f'/api/admin/event/{e}/meta',headers=AUTH,json={'archived':True}).status_code==409
+    copy=client.post(f'/api/admin/event/{e}/copy',headers=AUTH).json()
+    assert client.put(f'/api/admin/event/{copy["id"]}/meta',headers=AUTH,json={'template':True,'archived':True,'brand':'Пример','accent':'#123456'}).is_success
+    assert client.post('/api/admin/control',headers=AUTH,json={'event':copy['id'],'round':copy['round'],'opened':False,'display':'live'}).status_code==409
+    assert client.get(f'/api/admin/report/{e}/pdf',headers=AUTH).content.startswith(b'%PDF')
+    from openpyxl import load_workbook
+    import io
+    wb=load_workbook(io.BytesIO(client.get(f'/api/admin/report/{e}/xlsx',headers=AUTH).content))
+    assert wb.active['E2'].value==1
+    assert wb['Вопрос 1']._charts
+    assert b'<svg' in client.get('/api/admin/qr',headers=AUTH,params={'url':'http://192.168.1.2:8080/vote'}).content
+    assert client.get('/api/admin/qr',headers=AUTH,params={'url':'http://example.com/vote?key=secret'}).status_code==422
+    assert client.get('/api/admin/audit',headers=AUTH).json()['entries']
+    assert client.get('/api/admin/diagnostics',headers=AUTH).json()['database_ok']
+
+def test_release_resolver(monkeypatch):
+    import release_target as r
+    import io
+    monkeypatch.setattr(r.urllib.request,'urlopen',lambda *args,**kwargs:io.BytesIO(b'{"tag_name":"v0.11.0","draft":false,"prerelease":false}'))
+    assert r.latest_release()['version']=='0.11.0'
+    assert r.version_tuple('0.11.0')>r.version_tuple('0.9.2')
+    monkeypatch.setattr(r.urllib.request,'urlopen',lambda *args,**kwargs:io.BytesIO(b'{"tag_name":"v0.12.0-rc1","draft":false,"prerelease":true}'))
+    with pytest.raises(ValueError):r.latest_release()

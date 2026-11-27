@@ -9,7 +9,6 @@ let deviceLocked=false,deviceRevision=null;
 let timerEnd=null;
 function countdownText(end){const n=Math.max(0,Math.ceil(end-Date.now()/1000));return Math.floor(n/60)+':'+String(n%60).padStart(2,'0')}
 function clockTick(){const node=$('countdown');if(node){node.hidden=!timerEnd;node.textContent=timerEnd?'Осталось '+countdownText(timerEnd):''}}
-setInterval(clockTick,500);
 let fitStage=null,fitFrame=0,fitViewport='',fitScale=1;
 function scheduleFit(){if(kiosk&&!fitFrame)fitFrame=requestAnimationFrame(fitScreen)}
 function fitScreen(){
@@ -229,7 +228,7 @@ function check(parent,label,value){const row=el('div','check'),n=el('input');n.t
 let adminState=null, editorId=null;
 async function loadAdmin(){try{adminState=await (await api('/api/admin/state','GET',undefined,true)).json();conn(true);appearance(adminState);mode==='presenter'?renderPresenter():renderAdmin()}catch(e){conn(false);if(e.status===401||e.status===503){token='';sessionStorage.removeItem('votemera-admin');login(e.message)}else{main.replaceChildren(el('h2','',e.message),btn('Повторить',loadAdmin))}}}
 function login(msg=''){main.className='admin';main.replaceChildren();const p=el('form','panel login');p.append(el('h2','','Управление голосованием'));if(msg)p.append(el('p','muted',msg));const f=field(p,'Пароль администратора','','password');f.required=true;const b=el('button','','Войти');b.type='submit';p.append(add(el('div','actions'),b));p.onsubmit=e=>{e.preventDefault();token=f.value;sessionStorage.setItem('votemera-admin',token);loadAdmin()};main.append(p)}
-async function action(path,method,data,refresh=true){try{const r=await api(path,method,data,true);toast('Сохранено');if(refresh)await loadAdmin();return r}catch(e){toast(e.message);if(e.status===401)login(e.message);return null}}
+async function action(path,method,data,refresh=true){try{const r=await api(path,method,data,true);toast('Сохранено');if(refresh)await loadAdmin();return r}catch(e){toast(e.message);if(e.status===401){token='';sessionStorage.removeItem('votemera-admin');login(e.message)};return null}}
 function downloadAdmin(path,name){return api(path,'GET',undefined,true).then(async r=>{const url=URL.createObjectURL(await r.blob()),a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}).catch(e=>toast(e.message))}
 function maintenancePanel(parent){
  const panel=el('section','panel');parent.append(panel);panel.append(el('h2','','Обновление и резервное копирование'));const status=el('p','muted','Проверка службы…');panel.append(status);let timer=null;
@@ -342,7 +341,7 @@ function renderEditor(node,e=null,wizard=false){
  block.append(el('label','','Варианты ответа'),options);
  function option(o){if(options.children.length>=6){toast('Не более 6 вариантов');return}const row=el('div','option-row'),label=el('input'),color=el('input');label.placeholder='Вариант ответа';label.value=o?.label||'';label.setAttribute('aria-label','Название варианта');color.type='color';color.value=o?.color||palette[options.children.length];color.setAttribute('aria-label','Цвет варианта');row.append(label,color,btn('↑',()=>{if(row.previousElementSibling)rearrange(()=>options.insertBefore(row,row.previousElementSibling))}),btn('↓',()=>{if(row.nextElementSibling)rearrange(()=>options.insertBefore(row.nextElementSibling,row))}),btn('×',()=>{if(options.children.length>2)rearrange(()=>row.remove())}),dragHandle(row,options,'Перетащить вариант'));options.append(row)}
  (q?.options||templates.binary.map((label,i)=>({label,color:palette[i]}))).forEach(option);
- preset.onchange=()=>{if(preset.value&&confirm('Заменить варианты ответа шаблоном?')){options.replaceChildren();templates[preset.value].forEach((label,i)=>option({label,color:palette[i]}))}preset.value=''};
+ preset.onchange=()=>{if(preset.value&&confirm('Заменить варианты ответа шаблоном?'))rearrange(()=>{options.replaceChildren();templates[preset.value].forEach((label,i)=>option({label,color:palette[i]}))});preset.value=''};
  block.getData=()=>({question:input.value,description:desc.value,confirm:confirmation.checked,...(conditional.checked?{show_if:{question:Number(source.value)-1,choice:Number(sourceChoice.value)-1}}:{}),options:[...options.children].map(r=>({label:r.children[0].value,color:r.children[1].value}))});
  block.append(add(el('div','actions'),btn('+ Вариант',()=>option()),btn('↑ Вопрос',()=>{if(block.previousElementSibling)rearrange(()=>list.insertBefore(block,block.previousElementSibling))}),btn('↓ Вопрос',()=>{if(block.nextElementSibling)rearrange(()=>list.insertBefore(block.nextElementSibling,block))}),btn('Копировать',()=>rearrange(()=>question(block.getData(),block))),btn('Удалить вопрос',()=>{if(list.children.length>1)rearrange(()=>block.remove())},'danger')));
  if(after)after.after(block);else list.append(block);renumber()}
@@ -351,4 +350,5 @@ function renderEditor(node,e=null,wizard=false){
  if(wizard)setupWizard(node,data,title,rounds,list,tools);
 }
 initFit();
+setInterval(clockTick,500);
 if(mode==='display'&&new URLSearchParams(location.search).get('demo')==='1')demoDisplay();else if(mode==='vote'||mode==='display')startStream();else if(mode==='admin'){token?loadAdmin():login()}else if(mode==='presenter'){sandbox?loadAdmin():token?loadAdmin():login()}else{main.replaceChildren(el('h1','center','Votemera'),el('p','center muted','Локальная система интерактивного голосования'));const row=el('div','row');for(const [p,t] of [['vote','Терминал'],['display','Экран результатов'],['admin','Администрирование'],['presenter','Пульт ведущего']])row.append(btn(t,()=>location.href='/'+p,''));main.append(row);api('/api/state').then(r=>r.json()).then(s=>{appearance(s);conn(true)}).catch(()=>conn(false))}

@@ -520,6 +520,7 @@ def change_password(v:PasswordChange):
     with ACCESS_LOCK:
         if not verify_admin(v.current): fail(403,'Текущий пароль неверен')
         set_admin_password(value)
+    with db(True) as c: audit(c,'Смена пароля администратора')
     return {'ok':True}
 
 @app.get('/api/admin/keys',dependencies=[Depends(admin)])
@@ -536,6 +537,7 @@ def create_key(v:KeyCreate):
             kid=c.execute('INSERT INTO terminal_keys(label,digest,created) VALUES(?,?,?)',(clean(v.label),terminal_digest(c,value),time.time())).lastrowid
         except sqlite3.IntegrityError: fail(409,'Такой ключ уже существует')
         c.execute('UPDATE access_settings SET required=1 WHERE id=1')
+    with db(True) as c: audit(c,'Создание ключа терминала',kid)
     return {'id':kid,'key':value}
 
 def forget_key_terminals(kid):
@@ -548,6 +550,7 @@ def edit_key(kid:int,v:KeyEdit):
     with access_db(True) as c:
         if not c.execute('UPDATE terminal_keys SET label=?,enabled=? WHERE id=?',(clean(v.label),int(v.enabled),kid)).rowcount: fail(404,'Ключ не найден')
     if not v.enabled: forget_key_terminals(kid)
+    with db(True) as c: audit(c,'Изменение ключа терминала',kid)
     return {'ok':True}
 
 @app.post('/api/admin/keys/{kid}/rotate',dependencies=[Depends(admin)])
@@ -558,6 +561,7 @@ def rotate_key(kid:int,v:KeyRotate):
             if not c.execute('UPDATE terminal_keys SET digest=? WHERE id=?',(terminal_digest(c,value),kid)).rowcount: fail(404,'Ключ не найден')
         except sqlite3.IntegrityError: fail(409,'Такой ключ уже существует')
     forget_key_terminals(kid)
+    with db(True) as c: audit(c,'Замена ключа терминала',kid)
     return {'id':kid,'key':value}
 
 @app.delete('/api/admin/keys/{kid}',dependencies=[Depends(admin)])
@@ -565,6 +569,7 @@ def delete_key(kid:int):
     with access_db(True) as c:
         if not c.execute('DELETE FROM terminal_keys WHERE id=?',(kid,)).rowcount: fail(404,'Ключ не найден')
     forget_key_terminals(kid)
+    with db(True) as c: audit(c,'Удаление ключа терминала',kid)
     return {'ok':True}
 
 @app.get('/api/admin/state',dependencies=[Depends(admin)])
@@ -615,6 +620,7 @@ def copy_event(eid:int):
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
     with db(True) as c:
+        if not c.execute('SELECT 1 FROM events WHERE id=?',(v.event,)).fetchone(): fail(404,'Мероприятие не найдено')
         if meta(c,v.event)['archived']: fail(409,'Сначала восстановите мероприятие из архива')
         if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
         if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
@@ -750,7 +756,13 @@ def restore_database(path):
                 source.row_factory=sqlite3.Row
                 source.execute('PRAGMA trusted_schema=OFF')
                 source.execute('PRAGMA foreign_keys=ON')
-                if schema(source)!=expected_schema: fail(422,'Несовместимая схема базы: используйте копию той же версии')
+                # Previous backups may lack only the four additive v0.11 tables.
+                actual_schema=schema(source)
+                additions={'event_meta','runtime_config','terminal_config','audit_log'}
+                missing=expected_schema-actual_schema
+                if actual_schema-expected_schema or any(r[0]!='table' or r[1] not in additions for r in missing): fail(422,'Несовместимая схема базы')
+                for row in sorted(missing): source.execute(row[3])
+                source.execute('INSERT OR IGNORE INTO runtime_config(id) VALUES(1)')
                 if source.execute('PRAGMA quick_check').fetchone()[0]!='ok' or source.execute('PRAGMA foreign_key_check').fetchone(): fail(422,'Повреждённая база')
                 if source.execute('SELECT count(*) FROM settings').fetchone()[0]!=1: fail(422,'Некорректные настройки')
                 source.execute('UPDATE settings SET opened=0,epoch=?,display=? WHERE id=1',(uuid4().hex,'hidden'))
