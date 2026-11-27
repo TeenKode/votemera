@@ -22,6 +22,7 @@ target=$(git rev-parse "$tag^{commit}")
 git merge-base --is-ancestor "$old" "$target" && git merge-base --is-ancestor "$target" origin/main || { echo 'Релиз не является продолжением main'; exit 1; }
 [[ $(git show "$target:VERSION") == "${tag#v}" ]] || { echo 'Несовпадение версии релиза'; exit 1; }
 install -d -m 0700 /var/backups/votemera
+if [[ ! -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]]; then apt-get update && apt-get install -y fonts-dejavu-core || { echo 'Не удалось установить шрифт PDF'; exit 1; }; fi
 backup=$(mktemp /var/backups/votemera/XXXXXXXX.db)
 access_backup="$backup.access"
 # Stop writes for a consistent rollback boundary.

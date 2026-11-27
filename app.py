@@ -42,6 +42,7 @@ STREAM_LOCK = threading.Lock()
 STREAM_CACHE = {}
 TERMINALS = OrderedDict()
 TERMINALS_LOCK = threading.Lock()
+DISPLAYS=OrderedDict()
 WRITE_LOCK = threading.RLock()
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
@@ -499,6 +500,14 @@ def heartbeat(v:TerminalHeartbeat,key_id=Depends(terminal)):
         e=c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]
         return {'ok':True,'locked':bool(t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=e))),'revision':t['revision'] if t else 0,'label':t['label'] if t else ''}
 
+@app.post('/api/display/heartbeat')
+def display_heartbeat(v:TerminalHeartbeat):
+    now=time.monotonic()
+    with TERMINALS_LOCK:
+        DISPLAYS[v.terminal]=now; DISPLAYS.move_to_end(v.terminal)
+        while DISPLAYS and (len(DISPLAYS)>1024 or next(iter(DISPLAYS.values()))<now-60): DISPLAYS.popitem(last=False)
+    return {'ok':True}
+
 @app.get('/api/admin/terminals',dependencies=[Depends(admin)])
 def terminal_status():
     now=time.monotonic()
@@ -892,7 +901,8 @@ def diagnostics():
     backup_status=None
     try: backup_status=json.loads((DB.parent/'backup-status.json').read_text())
     except (OSError,ValueError): pass
-    return {'backup':backup_status,'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
+    with TERMINALS_LOCK: display_count=sum(now>time.monotonic()-25 for now in DISPLAYS.values())
+    return {'displays':display_count,'backup':backup_status,'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
 
 def effective_open_for(s,end):
     return bool(s['opened'] and (end is None or end>time.time()))
@@ -916,7 +926,8 @@ def report(eid:int,fmt:Literal['pdf','xlsx']):
         if not e: fail(404,'Мероприятие не найдено')
         qs=questions(e)
         rows=[(r['name'],results(c,r['id'],qs)) for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,))]
-    data,media=make_report(e['title'],qs,rows,fmt)
+    try: data,media=make_report(e['title'],qs,rows,fmt)
+    except FileNotFoundError: fail(503,'Для PDF установите fonts-dejavu-core на сервере')
     return Response(data,media_type=media,headers={'Content-Disposition':f'attachment; filename="votemera-{eid}.{fmt}"'})
 
 init()

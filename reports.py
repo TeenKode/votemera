@@ -42,10 +42,8 @@ def make_report(title,questions,rounds,fmt):
     from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,KeepTogether
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    font=Path('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
-    if not font.exists():
-        import reportlab
-        font=Path(reportlab.__file__).parent/'fonts'/'Vera.ttf'
+    font=next((Path(p) for p in ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf','/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf','/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf','/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf') if Path(p).exists()),None)
+    if font is None: raise FileNotFoundError('Install fonts-dejavu-core for Cyrillic reports')
     pdfmetrics.registerFont(TTFont('VotemeraReport',str(font)))
     styles={name:ParagraphStyle(name,fontName='VotemeraReport',fontSize=size,leading=size*1.35,textColor=colors.HexColor('#162132')) for name,size in [('title',19),('head',13),('body',9)]}
     def p(text,style='body'):return Paragraph(escape(str(text)),styles[style])

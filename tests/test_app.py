@@ -358,7 +358,9 @@ def test_archive_reports_qr_and_audit(client):
     assert b'<svg' in client.get('/api/admin/qr',headers=AUTH,params={'url':'http://192.168.1.2:8080/vote'}).content
     assert client.get('/api/admin/qr',headers=AUTH,params={'url':'http://example.com/vote?key=secret'}).status_code==422
     assert client.get('/api/admin/audit',headers=AUTH).json()['entries']
-    assert client.get('/api/admin/diagnostics',headers=AUTH).json()['database_ok']
+    assert client.post('/api/display/heartbeat',json={'terminal':uuid.uuid4().hex}).is_success
+    diag=client.get('/api/admin/diagnostics',headers=AUTH).json()
+    assert diag['database_ok'] and diag['displays']>=1
 
 def test_release_resolver(monkeypatch):
     import release_target as r

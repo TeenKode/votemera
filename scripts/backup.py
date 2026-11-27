@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Root-only online SQLite backup (data + access + configuration)."""
-import json,os,sqlite3,tempfile,shutil,sys,time
+import fcntl,json,os,sqlite3,tempfile,shutil,sys,time
 from pathlib import Path
 from datetime import datetime,timezone
 from contextlib import closing
@@ -23,6 +23,7 @@ def publish_status(data):
 
 def copy_db(source,dest):
     with closing(sqlite3.connect(f'file:{source}?mode=ro',uri=True,timeout=30)) as src, closing(sqlite3.connect(dest)) as target:
+        src.execute('PRAGMA trusted_schema=OFF')
         src.backup(target)
         if target.execute('PRAGMA quick_check').fetchone()[0]!='ok':raise RuntimeError('Backup integrity check failed')
     os.chmod(dest,0o600)
@@ -50,7 +51,10 @@ def main():
         if tmp.exists():shutil.rmtree(tmp)
 
 if __name__=='__main__':
-    try: main()
+    try:
+        with open('/run/lock/votemera-update.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_SH)
+            main()
     except Exception:
         try: publish_status({'state':'failed','time':time.time()})
         except OSError:pass
