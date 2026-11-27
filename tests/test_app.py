@@ -385,3 +385,54 @@ def test_vote_style_and_stream_cache(client):
     after=json.loads(a.stream_snapshot('display'))
     assert after['event']['rounds'][0]['total']==1
     assert 'results' not in json.loads(a.stream_snapshot('vote'))['event']['rounds'][0]
+
+def test_yandex_integration_aggregate_and_privacy(client,monkeypatch):
+    import yandex_forms as yf
+    sid='a'*24
+    def mock(org,token,path,params=None):
+        assert org=='123456' and token=='oauth-test-secret'
+        if path=='/v1/users/me/':return {'id':1}
+        if path=='/v1/surveys':return {'result':[{'id':sid,'name':'Опрос','is_published':True}]}
+        if path.endswith('/questions'):return {'pages':[{'items':[{'id':10,'label':'Выбор','type':'enum','widget':'checkbox','items':[{'label':'Да'},{'label':'Нет'}]},{'id':11,'label':'ФИО','type':'string'}]}]}
+        if '/answers' in path:
+            return {'columns':[{'id':10}],'answers':[{'id':1,'data':[{'value':['Да','Нет']}]},{'id':2,'data':[{'value':['Да']}]},{'id':2,'data':[{'value':['Да']}]}]}
+        raise AssertionError(path)
+    monkeypatch.setattr(yf,'request',mock)
+    assert client.put('/api/admin/yandex',headers=AUTH,json={'org':'123456','token':'oauth-test-secret'}).is_success
+    assert client.get('/api/admin/yandex/forms',headers=AUTH).json()['forms'][0]['id']==sid
+    assert 'oauth-test-secret' not in client.get('/api/admin/yandex',headers=AUTH).text
+    assert client.get('/api/admin/yandex/forms/'+sid,headers=AUTH).json()['questions'][1]['supported'] is False
+    response=client.post('/api/admin/yandex/events',headers=AUTH,json={'form_id':sid,'title':'Импорт','questions':[10]})
+    assert response.is_success,response.text
+    created=response.json();eid=created['id'];rid=created['round']
+    assert a.yf_sync(eid)
+    assert a.yf_sync(eid)
+    assert client.post('/api/admin/control',headers=AUTH,json={'event':eid,'round':rid,'opened':False,'display':'live'}).is_success
+    public=client.get('/api/state').json()
+    assert public['event']['rounds'][0]['total']==2
+    assert public['event']['rounds'][0]['results'][0]=={'total':2,'counts':[2,1]}
+    assert 'oauth-test-secret' not in client.get('/api/state').text
+    assert 'results' not in client.get('/api/state?view=vote').json()['event']['rounds'][0]
+    assert client.get(f'/api/admin/report/{eid}/xlsx',headers=AUTH).is_success
+    assert client.get(f'/api/admin/report/{eid}/pdf',headers=AUTH).is_success
+    assert b'<svg' in client.get(f'/api/admin/yandex/events/{eid}/qr',headers=AUTH).content
+    assert client.post('/api/admin/control',headers=AUTH,json={'event':eid,'round':rid,'opened':True,'display':'live'}).status_code==409
+    def unavailable(*args,**kw):raise yf.FormsError('Нет связи')
+    monkeypatch.setattr(yf,'request',unavailable)
+    assert not a.yf_sync(eid)
+    public=client.get('/api/state').json()
+    assert public['external']['stale'] and public['event']['rounds'][0]['total']==2
+    assert client.get('/api/admin/yandex').status_code==401
+    assert b'oauth-test-secret' not in client.get('/api/admin/backup',headers=AUTH).content
+
+def test_yandex_pagination_and_dedup(monkeypatch):
+    import yandex_forms as yf
+    sid='b'*24;path='/v1/surveys/'+sid+'/answers'
+    def get(org,token,p,params=None):
+        if params:
+            assert params['questions']=='10' and params['date_from']=='2026-01-01T00:00:00+00:00'
+            return {'columns':[{'id':10}],'answers':[{'id':1,'data':[{'value':['Да']}]}],'next':{'next_url':path+'?id=1'}}
+        return {'answers':[{'id':1,'data':[{'value':['Да']}]},{'id':2,'data':[{'value':['Нет']}]}]}
+    monkeypatch.setattr(yf,'request',get)
+    spec=[{'id':10,'kind':'enum','multi':False,'options':[{'label':'Да'},{'label':'Нет'}]}]
+    assert yf.aggregate('123','secret',sid,spec,'2026-01-01T00:00:00+00:00')=={'total':2,'results':[{'total':2,'counts':[1,1]}]}
