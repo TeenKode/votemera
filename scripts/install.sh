@@ -37,6 +37,7 @@ ReadWritePaths=/var/lib/votemera
 WantedBy=multi-user.target
 UNIT
 bash "$APP/scripts/install-updater.sh"
+bash "$APP/scripts/install-backup.sh"
 systemctl daemon-reload
 systemctl enable --now votemera
 systemctl restart votemera

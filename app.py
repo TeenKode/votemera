@@ -35,12 +35,17 @@ UPDATE_REQUEST = Path('/var/lib/votemera/update-request')
 UPDATE_REMOTE = 'https://github.com/TeenKode/votemera.git'
 AUTH_FAILURES = OrderedDict()
 AUTH_LOCK = threading.Lock()
+VERIFIED_ADMINS = OrderedDict()
+VERIFIED_KEYS = OrderedDict()
+KEY_CACHE_LOCK = threading.Lock()
+STREAM_LOCK = threading.Lock()
+STREAM_CACHE = {}
 TERMINALS = OrderedDict()
 TERMINALS_LOCK = threading.Lock()
 WRITE_LOCK = threading.RLock()
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 COLORS = ['#0f9f78','#df5363','#397dd8','#bd8c22','#895bd4','#168da4']
-DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full', idle_timeout=90)
+DEFAULTS = dict(brand='Votemera', subtitle='Интерактивное голосование', theme='dark', accent='#43c8bd', cooldown=1800, show_percent=True, show_count=True, chart='stack', thank_you='Спасибо за ваш голос!', display_page_size=4, display_rotate=12, vote_layout='auto', motion='full', idle_timeout=90, backup_enabled=True, backup_retention=14)
 
 @contextmanager
 def db(write=False, transaction=True):
@@ -98,7 +103,15 @@ def verify_admin(value):
     with access_db() as c:
         row=c.execute('SELECT password_salt,password_hash FROM access_settings WHERE id=1').fetchone()
     if not row['password_hash']: fail(503,'Пароль администратора не настроен на сервере')
-    return bool(len(value)<=512 and secret_eq(password_hash(value,row['password_salt']),row['password_hash']))
+    if len(value)>512: return False
+    fingerprint=hashlib.sha256(value.encode()).digest()
+    cache_key=(fingerprint,row['password_salt'],row['password_hash'])
+    if cache_key in VERIFIED_ADMINS: return True
+    valid=secret_eq(password_hash(value,row['password_salt']),row['password_hash'])
+    if valid:
+        VERIFIED_ADMINS[cache_key]=True
+        while len(VERIFIED_ADMINS)>16: VERIFIED_ADMINS.popitem(last=False)
+    return valid
 
 def set_admin_password(value):
     salt=secrets.token_bytes(32)
@@ -175,8 +188,15 @@ def terminal(x_terminal_key: str = Header(default='')):
         required=c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]
         if not required: return None
         if not x_terminal_key or len(x_terminal_key)>512: fail(403,'Неверный ключ терминала')
-        row=c.execute('SELECT id FROM terminal_keys WHERE digest=? AND enabled=1',(terminal_digest(c,x_terminal_key),)).fetchone()
+        salt=c.execute('SELECT key_salt FROM access_settings WHERE id=1').fetchone()[0]
+        fingerprint=(hashlib.sha256(x_terminal_key.encode()).digest(),salt)
+        with KEY_CACHE_LOCK: digest=VERIFIED_KEYS.get(fingerprint)
+        if digest is None: digest=password_hash(x_terminal_key,salt,KEY_ROUNDS)
+        row=c.execute('SELECT id FROM terminal_keys WHERE digest=? AND enabled=1',(digest,)).fetchone()
         if not row: fail(403,'Неверный или отключённый ключ терминала')
+        with KEY_CACHE_LOCK:
+            VERIFIED_KEYS[fingerprint]=digest
+            while len(VERIFIED_KEYS)>128: VERIFIED_KEYS.popitem(last=False)
         return row['id']
 
 def clean(s):
@@ -217,6 +237,8 @@ class Settings(BaseModel):
     vote_layout: Literal["auto","grid","list"] = "auto"
     motion: Literal["full","subtle","off"] = "full"
     idle_timeout: int = Field(default=90,ge=0,le=600)
+    backup_enabled: bool=True
+    backup_retention: int=Field(default=14,ge=1,le=90)
 class Control(BaseModel):
     event: int
     round: int
@@ -387,14 +409,22 @@ def health():
 @app.get('/api/state')
 def state(view: Literal['vote','display']='display'):
     with db() as c: return snapshot(c,voting=view=='vote')
+def stream_snapshot(view):
+    # Coalesce expensive aggregate reads across simultaneous displays/terminals.
+    with STREAM_LOCK:
+        key=(str(DB),view); now=time.monotonic(); cached=STREAM_CACHE.get(key)
+        if cached and now-cached[0]<.35: return cached[1]
+        with db() as c: data=json.dumps(snapshot(c,voting=view=='vote'),ensure_ascii=False,separators=(',',':'))
+        if len(STREAM_CACHE)>8: STREAM_CACHE.clear()
+        STREAM_CACHE[key]=(time.monotonic(),data)
+        return data
+
 @app.get('/api/stream')
 async def stream(request:Request, view: Literal['vote','display']='display'):
     async def events():
         last=''; beat=0
         while not await request.is_disconnected():
-            def read():
-                with db() as c: return json.dumps(snapshot(c,voting=view=='vote'),ensure_ascii=False,separators=(',',':'))
-            data=await asyncio.to_thread(read)
+            data=await asyncio.to_thread(stream_snapshot,view)
             if data!=last:
                 yield 'data: '+data+'\n\n'; last=data; beat=0
             elif beat>=30:
@@ -677,10 +707,10 @@ def update_info(check: bool=False):
     if check and status!='unavailable' and not update_busy():
         try:
             local=subprocess.check_output(['git','-c',f'safe.directory={ROOT}','-C',str(ROOT),'rev-parse','HEAD'],text=True,timeout=5).strip()
-            remote=subprocess.check_output(['git','-c','credential.helper=','ls-remote',UPDATE_REMOTE,'refs/heads/main'],text=True,timeout=12,env={**os.environ,'GIT_TERMINAL_PROMPT':'0','GIT_ASKPASS':'/bin/false','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null'}).split()
-            if not remote or not re.fullmatch(r'[a-f0-9]{40}',remote[0]): raise ValueError('Invalid remote ref')
-            info.update(available=local!=remote[0],latest=remote[0][:10])
-        except (OSError,subprocess.SubprocessError,ValueError):
+            from release_target import latest_release,version_tuple
+            release=latest_release()
+            info.update(available=version_tuple(release['version'])>version_tuple(VERSION),latest=release['version'])
+        except (OSError,subprocess.SubprocessError,ValueError,KeyError):
             info['error']='Не удалось проверить GitHub. Проверьте подключение к интернету.'
     return info
 
@@ -847,7 +877,10 @@ def diagnostics():
         db_ok=status=='ok'
         end=deadline(c)
     disk=shutil.disk_usage(DB.parent)
-    return {'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
+    backup_status=None
+    try: backup_status=json.loads((DB.parent/'backup-status.json').read_text())
+    except (OSError,ValueError): pass
+    return {'backup':backup_status,'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
 
 def effective_open_for(s,end):
     return bool(s['opened'] and (end is None or end>time.time()))
