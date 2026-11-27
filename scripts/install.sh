@@ -4,7 +4,7 @@ set -euo pipefail
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 APP=/opt/votemera; CONF=/etc/votemera; DATA=/var/lib/votemera
 apt-get update
-apt-get install -y python3 python3-venv git curl rsync openssl sqlite3
+apt-get install -y python3 python3-venv git curl rsync openssl sqlite3 fonts-dejavu-core
 id votemera >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell /usr/sbin/nologin votemera
 install -d -m 0755 "$APP" "$CONF"; install -d -m 0750 -o votemera -g votemera "$DATA"
 if [[ ! -f "$CONF/server.env" ]]; then

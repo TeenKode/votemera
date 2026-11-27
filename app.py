@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import binascii
+import shutil
 import csv
 import hmac
 import hashlib
@@ -139,6 +142,11 @@ def init():
         c.execute('CREATE TABLE IF NOT EXISTS analysis_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE, first_q INTEGER NOT NULL, second_q INTEGER NOT NULL, chart TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS presentation_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,data TEXT NOT NULL)')
         c.execute('CREATE INDEX IF NOT EXISTS votes_question ON votes(round_id,question_index,choice)')
+        c.execute('CREATE TABLE IF NOT EXISTS event_meta(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,archived INTEGER NOT NULL DEFAULT 0,template INTEGER NOT NULL DEFAULT 0,brand TEXT NOT NULL DEFAULT "",accent TEXT NOT NULL DEFAULT "",logo TEXT NOT NULL DEFAULT "")')
+        c.execute('CREATE TABLE IF NOT EXISTS runtime_config(id INTEGER PRIMARY KEY CHECK(id=1),deadline REAL)')
+        c.execute('INSERT OR IGNORE INTO runtime_config(id) VALUES(1)')
+        c.execute('CREATE TABLE IF NOT EXISTS terminal_config(id TEXT PRIMARY KEY,label TEXT NOT NULL DEFAULT "",locked INTEGER NOT NULL DEFAULT 0,event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,revision INTEGER NOT NULL DEFAULT 0)')
+        c.execute('CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,created REAL NOT NULL,action TEXT NOT NULL,detail TEXT NOT NULL)')
         c.execute('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)',(json.dumps(DEFAULTS),))
         if not c.execute('SELECT 1 FROM events LIMIT 1').fetchone():
             e=c.execute('INSERT INTO events(title,question,options,created) VALUES(?,?,?,?)',('Педагогический совет','Готовы ли вы использовать искусственный интеллект в профессиональной деятельности?',json.dumps([{'label':'Да','color':COLORS[0]},{'label':'Нет','color':COLORS[1]}]),time.time())).lastrowid
@@ -202,7 +210,7 @@ class Settings(BaseModel):
     cooldown: int = Field(ge=500,le=10000)
     show_percent: bool
     show_count: bool
-    chart: Literal['stack','bars']
+    chart: Literal['stack','bars','donut']
     thank_you: str = Field(min_length=1,max_length=120)
     display_page_size: Literal[1,2,4] = 4
     display_rotate: int = Field(default=12,ge=0,le=120)
@@ -214,6 +222,7 @@ class Control(BaseModel):
     round: int
     opened: bool
     display: Literal['live','compare','hidden','analysis','analysis_compare','presentation']
+    duration: int | None = Field(default=None,ge=0,le=86400)
 class AnalysisConfig(BaseModel):
     first: int = Field(ge=0,le=11)
     second: int = Field(ge=0,le=11)
@@ -307,13 +316,37 @@ def presentation_config(c,eid,qs):
     row=c.execute('SELECT data FROM presentation_config WHERE event_id=?',(eid,)).fetchone()
     return json.loads(row['data']) if row else dict(order=list(range(len(qs))),slides=[],seconds=15)
 
+def audit(c,action,detail=''):
+    c.execute('INSERT INTO audit_log(created,action,detail) VALUES(?,?,?)',(time.time(),action,str(detail)[:500]))
+    c.execute('DELETE FROM audit_log WHERE id <= (SELECT max(id)-5000 FROM audit_log)')
+
+def meta(c,eid):
+    row=c.execute('SELECT archived,template,brand,accent,logo FROM event_meta WHERE event_id=?',(eid,)).fetchone()
+    return dict(row) if row else dict(archived=0,template=0,brand='',accent='',logo='')
+
+def deadline(c):
+    return c.execute('SELECT deadline FROM runtime_config WHERE id=1').fetchone()[0]
+
+def effective_open(c,s):
+    end=deadline(c)
+    return bool(s['opened'] and (end is None or end>time.time()))
+
+def terminal_allowed(c,tid,eid):
+    t=c.execute('SELECT locked,event_id FROM terminal_config WHERE id=?',(tid,)).fetchone()
+    if t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=eid)):
+        fail(403,'Терминал заблокирован или назначен другому мероприятию')
+
 def snapshot(c, private=False, voting=False):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
     cfg=DEFAULTS | json.loads(s['data'])
     e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
-    result=dict(settings=cfg, event=None, round=s['active_round'], opened=bool(s['opened']), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
+    result=dict(settings=cfg, event=None, round=s['active_round'], opened=effective_open(c,s), deadline=deadline(c), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
     if e:
-        qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs)
+        qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs); m=meta(c,e['id'])
+        if m['brand']: cfg['brand']=m['brand']
+        if m['accent']: cfg['accent']=m['accent']
+        result['logo']=m['logo']
+        if private: result['settings']=DEFAULTS | json.loads(s['data'])
         for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(e['id'],)):
             item=dict(id=r['id'],name=r['name'])
             if private or (not voting and s['display']!='hidden' and (s['display'] in ('compare','analysis_compare','presentation') or r['id']==s['active_round'])):
@@ -323,10 +356,11 @@ def snapshot(c, private=False, voting=False):
                     item['cross']=cross_results(c,r['id'],qs,ac['first'],ac['second'])
             rounds.append(item)
         result['event']=dict(id=e['id'],title=e['title'],question=e['question'],options=options,questions=qs,rounds=rounds)
+        if private: result['event']['meta']=m
         if private or (not voting and s['display'] in ('analysis','analysis_compare','presentation')): result['event']['analysis']=ac
         if not voting: result['event']['presentation']=presentation_config(c,e['id'],qs)
     if private:
-        result['events']=[dict(x) for x in c.execute('SELECT e.id,e.title,e.question,e.created,(SELECT count(*) FROM rounds WHERE event_id=e.id) AS round_count,(SELECT count(*) FROM votes v JOIN rounds r ON r.id=v.round_id WHERE r.event_id=e.id AND v.question_index=0) AS total FROM events e ORDER BY e.id DESC')]
+        result['events']=[dict(x) for x in c.execute('SELECT e.id,e.title,e.question,e.created,coalesce(m.archived,0) archived,coalesce(m.template,0) template,(SELECT count(*) FROM rounds WHERE event_id=e.id) AS round_count,(SELECT count(*) FROM votes v JOIN rounds r ON r.id=v.round_id WHERE r.event_id=e.id AND v.question_index=0) AS total FROM events e LEFT JOIN event_meta m ON m.event_id=e.id ORDER BY e.id DESC')]
     return result
 
 app=FastAPI(title='Votemera',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None)
@@ -344,6 +378,7 @@ async def headers(request, call_next):
 @app.get('/vote')
 @app.get('/display')
 @app.get('/admin')
+@app.get('/presenter')
 def page(): return FileResponse(ROOT/'static'/'index.html')
 @app.get('/health')
 def health():
@@ -375,7 +410,8 @@ def vote(v:Vote):
             if (old['round_id'],old['choice'],old['terminal']) != (v.round,v.choice,v.terminal): fail(409,'Конфликт идентификатора')
             return {'ok':True,'duplicate':True}
         s=c.execute('SELECT * FROM settings').fetchone()
-        if not s['opened'] or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Повторите выбор.')
+        terminal_allowed(c,v.terminal,s['active_event'])
+        if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Повторите выбор.')
         e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
         if e and len(questions(e))!=1: fail(409,'Для нескольких вопросов отправьте анкету целиком')
         if not e or v.choice>=len(questions(e)[0]['options']): fail(422,'Неизвестный вариант')
@@ -408,7 +444,8 @@ def ballot(v:Ballot):
             if not e or not valid_ballot(questions(e),v.choices): fail(409,'Конфликт анкеты')
             return {'ok':True,'duplicate':True}
         s=c.execute('SELECT * FROM settings').fetchone()
-        if not s['opened'] or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Начните заново.')
+        terminal_allowed(c,v.terminal,s['active_event'])
+        if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Начните заново.')
         e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
         qs=questions(e)
         if not valid_ballot(qs,v.choices): fail(422,'Неверные ответы или пропуски анкеты')
@@ -427,7 +464,10 @@ def heartbeat(v:TerminalHeartbeat,key_id=Depends(terminal)):
         TERMINALS.move_to_end(v.terminal)
         while TERMINALS and (len(TERMINALS)>4096 or next(iter(TERMINALS.values()))[0]<now-300):
             TERMINALS.popitem(last=False)
-    return {'ok':True}
+    with db() as c:
+        t=c.execute('SELECT * FROM terminal_config WHERE id=?',(v.terminal,)).fetchone()
+        e=c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]
+        return {'ok':True,'locked':bool(t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=e))),'revision':t['revision'] if t else 0,'label':t['label'] if t else ''}
 
 @app.get('/api/admin/terminals',dependencies=[Depends(admin)])
 def terminal_status():
@@ -436,7 +476,12 @@ def terminal_status():
         names={r['id']:r['label'] for r in c.execute('SELECT id,label FROM terminal_keys WHERE enabled=1')}
         required=bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0])
     with TERMINALS_LOCK:
-        rows=[dict(id=k[-8:],seconds_ago=int(now-t),online=now-t<25 and (kid in names or (kid is None and not required)),key_name=names.get(kid,'Без ключа' if kid is None else 'Ключ отозван')) for k,(t,kid) in reversed(TERMINALS.items()) if now-t<300]
+        rows=[dict(id=k[-8:],device_id=k,seconds_ago=int(now-t),online=now-t<25 and (kid in names or (kid is None and not required)),key_name=names.get(kid,'Без ключа' if kid is None else 'Ключ отозван')) for k,(t,kid) in reversed(TERMINALS.items()) if now-t<300]
+    with db() as c:
+        configs={r['id']:dict(r) for r in c.execute('SELECT * FROM terminal_config')}
+    for r in rows: r.update({k:v for k,v in configs.get(r['device_id'],{}).items() if k!='id'})
+    for tid,t in configs.items():
+        if not any(r['device_id']==tid for r in rows): rows.append(dict(device_id=tid,id=tid[-8:],seconds_ago=None,online=False,key_name='',**{k:v for k,v in t.items() if k!='id'}))
     return {'online':sum(r['online'] for r in rows),'terminals':rows}
 
 @app.put('/api/admin/password',dependencies=[Depends(admin)])
@@ -501,25 +546,27 @@ def new_event(e:Event):
     with db(True) as c:
         eid=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(clean(e.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),time.time(),json.dumps(qs,ensure_ascii=False))).lastrowid
         ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(eid,n,i)).lastrowid for i,n in enumerate(names)]
+        audit(c,'Создание мероприятия',eid)
     return {'id':eid,'round':ids[0]}
 @app.get('/api/admin/event/{eid}',dependencies=[Depends(admin)])
 def event_detail(eid:int):
     with db() as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
-        return dict(id=eid,title=e['title'],question=e['question'],options=json.loads(e['options']),questions=questions(e),rounds=[dict(r) for r in c.execute('SELECT id,name FROM rounds WHERE event_id=? ORDER BY position',(eid,))])
+        return dict(id=eid,title=e['title'],question=e['question'],options=json.loads(e['options']),questions=questions(e),meta=meta(c,eid),rounds=[dict(r) for r in c.execute('SELECT id,name FROM rounds WHERE event_id=? ORDER BY position',(eid,))])
 @app.put('/api/admin/event/{eid}',dependencies=[Depends(admin)])
 def edit_event(eid:int,e:Event):
     qs,names=validate_event(e)
     with db(True) as c:
         if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Не найдено')
         s=c.execute('SELECT * FROM settings').fetchone()
-        if (s['active_event']==eid and s['opened']) or c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Редактирование доступно только до начала голосования или после очистки всех этапов')
+        if (s['active_event']==eid and effective_open(c,s)) or c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Редактирование доступно только до начала голосования или после очистки всех этапов')
         c.execute('UPDATE events SET title=?,question=?,options=?,questions=? WHERE id=?',(clean(e.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),json.dumps(qs,ensure_ascii=False),eid))
         c.execute('DELETE FROM analysis_config WHERE event_id=?',(eid,))
         c.execute('DELETE FROM presentation_config WHERE event_id=?',(eid,))
         c.execute('DELETE FROM rounds WHERE event_id=?',(eid,)); ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(eid,n,i)).lastrowid for i,n in enumerate(names)]
         if s['active_event']==eid: c.execute('UPDATE settings SET active_round=?,epoch=? WHERE id=1',(ids[0],uuid4().hex))
+        audit(c,'Редактирование мероприятия',eid)
     return {'id':eid,'round':ids[0]}
 @app.delete('/api/admin/event/{eid}',dependencies=[Depends(admin)])
 def delete_event(eid:int,confirm_results:bool=False):
@@ -527,6 +574,7 @@ def delete_event(eid:int,confirm_results:bool=False):
         if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Мероприятие не найдено')
         if c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]==eid: fail(409,'Сначала выберите другое активное мероприятие')
         if not confirm_results and c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Подтвердите удаление результатов')
+        audit(c,'Удаление мероприятия',eid)
         c.execute('DELETE FROM events WHERE id=?',(eid,))
     return {'ok':True}
 
@@ -537,10 +585,15 @@ def copy_event(eid:int):
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
     with db(True) as c:
+        if meta(c,v.event)['archived']: fail(409,'Сначала восстановите мероприятие из архива')
         if v.opened and update_busy(): fail(409,'Дождитесь завершения обновления')
         if not c.execute('SELECT 1 FROM rounds WHERE id=? AND event_id=?',(v.round,v.event)).fetchone(): fail(422,'Неверный этап')
         s=c.execute('SELECT * FROM settings').fetchone()
-        epoch=uuid4().hex if (s['active_event'],s['active_round'],bool(s['opened']))!=(v.event,v.round,v.opened) else s['epoch']
+        changed=(s['active_event'],s['active_round'],effective_open(c,s))!=(v.event,v.round,v.opened)
+        epoch=uuid4().hex if changed else s['epoch']
+        if not v.opened or changed or v.duration is not None:
+            c.execute('UPDATE runtime_config SET deadline=? WHERE id=1',(time.time()+v.duration if v.opened and v.duration else None,))
+        if changed or s['display']!=v.display or v.duration is not None: audit(c,'Управление этапом',f'Мероприятие {v.event}, этап {v.round}, открыто={v.opened}, экран={v.display}')
         c.execute('UPDATE settings SET active_event=?,active_round=?,opened=?,epoch=?,display=? WHERE id=1',(v.event,v.round,int(v.opened),epoch,v.display))
         return snapshot(c,private=True)
 @app.put('/api/admin/analysis/{eid}',dependencies=[Depends(admin)])
@@ -573,20 +626,23 @@ def clone_event(eid:int,prefix:str):
         if not e: fail(404,'Мероприятие не найдено')
         new=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(prefix+e['title'][:120-len(prefix)],e['question'],e['options'],time.time(),e['questions'])).lastrowid
         ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(new,r['name'],r['position'])).lastrowid for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,)).fetchall()]
-        for name,columns in [('analysis_config','first_q,second_q,chart'),('presentation_config','data')]:
+        for name,columns in [('analysis_config','first_q,second_q,chart'),('presentation_config','data'),('event_meta','brand,accent,logo')]:
             c.execute(f'INSERT INTO {name}(event_id,{columns}) SELECT ?,{columns} FROM {name} WHERE event_id=?',(new,eid))
     return {'id':new,'round':ids[0]}
 
 @app.put('/api/admin/settings',dependencies=[Depends(admin)])
 def settings(v:Settings):
-    with db(True) as c: c.execute('UPDATE settings SET data=? WHERE id=1',(json.dumps(v.model_dump(),ensure_ascii=False),))
+    with db(True) as c:
+        c.execute('UPDATE settings SET data=? WHERE id=1',(json.dumps(v.model_dump(),ensure_ascii=False),))
+        audit(c,'Настройки системы')
     return {'ok':True}
 @app.delete('/api/admin/round/{rid}/votes',dependencies=[Depends(admin)])
 def clear(rid:int):
     with db(True) as c:
         s=c.execute('SELECT * FROM settings').fetchone()
-        if s['opened'] and s['active_round']==rid: fail(409,'Сначала закройте этап')
+        if effective_open(c,s) and s['active_round']==rid: fail(409,'Сначала закройте этап')
         if not c.execute('SELECT 1 FROM rounds WHERE id=?',(rid,)).fetchone(): fail(404,'Этап не найден')
+        audit(c,'Очистка голосов',rid)
         c.execute('DELETE FROM votes WHERE round_id=?',(rid,))
         if s['active_round']==rid: c.execute('UPDATE settings SET epoch=? WHERE id=1',(uuid4().hex,))
     return {'ok':True}
@@ -632,7 +688,7 @@ def update_info(check: bool=False):
 def request_update():
     with db(True) as c:
         if update_status()=='unavailable': fail(503,'Модуль обновления не установлен. Запустите scripts/install.sh.')
-        if c.execute('SELECT opened FROM settings WHERE id=1').fetchone()[0]: fail(409,'Сначала закройте голосование')
+        if effective_open(c,c.execute('SELECT * FROM settings WHERE id=1').fetchone()): fail(409,'Сначала закройте голосование')
         if update_busy(): fail(409,'Обновление уже запущено')
         try:
             fd=os.open(UPDATE_REQUEST,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
@@ -656,7 +712,7 @@ def restore_database(path):
         return set(tuple(r) for r in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
     with WRITE_LOCK:
         with db() as current:
-            if current.execute('SELECT opened FROM settings WHERE id=1').fetchone()[0]: fail(409,'Сначала закройте голосование')
+            if effective_open(current,current.execute('SELECT * FROM settings WHERE id=1').fetchone()): fail(409,'Сначала закройте голосование')
             if update_busy(): fail(409,'Дождитесь завершения обновления')
             expected_schema=schema(current)
         try:
@@ -668,6 +724,7 @@ def restore_database(path):
                 if source.execute('PRAGMA quick_check').fetchone()[0]!='ok' or source.execute('PRAGMA foreign_key_check').fetchone(): fail(422,'Повреждённая база')
                 if source.execute('SELECT count(*) FROM settings').fetchone()[0]!=1: fail(422,'Некорректные настройки')
                 source.execute('UPDATE settings SET opened=0,epoch=?,display=? WHERE id=1',(uuid4().hex,'hidden'))
+                source.execute('UPDATE runtime_config SET deadline=NULL WHERE id=1')
                 source.commit()
                 preview=snapshot(source,private=True)
                 if not preview['event'] or not any(r['id']==preview['round'] for r in preview['event']['rounds']): fail(422,'Нет корректного активного мероприятия')
@@ -722,5 +779,99 @@ def cross_export(eid:int):
                 for j,n in enumerate(row):
                     w.writerow([safe(r['name']),safe(a['question']),safe(a['options'][i]['label']),safe(b['question']),safe(b['options'][j]['label']),n,f"{n*100/d['totals'][i] if d['totals'][i] else 0:.2f}",d['totals'][i]])
     return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="votemera-cross-{eid}.csv"'})
+
+class EventMeta(BaseModel):
+    archived: bool=False
+    template: bool=False
+    brand: str=Field(default='',max_length=80)
+    accent: str=Field(default='',pattern=r'^$|^#[a-fA-F0-9]{6}$')
+    logo: str=Field(default='',max_length=280000)
+
+class TerminalConfig(BaseModel):
+    label: str=Field(default='',max_length=80)
+    locked: bool=False
+    event_id: int | None=None
+    reload: bool=False
+
+class LiveControl(BaseModel):
+    opened: bool | None=None
+    display: Literal['live','compare','hidden','analysis','analysis_compare','presentation'] | None=None
+    duration: int | None=Field(default=None,ge=0,le=86400)
+    round: int | None=None
+
+@app.put('/api/admin/event/{eid}/meta',dependencies=[Depends(admin)])
+def event_metadata(eid:int,v:EventMeta):
+    if v.logo:
+        m=re.fullmatch(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)',v.logo)
+        if not m: fail(422,'Допустимы PNG, JPEG и WebP')
+        try:
+            raw=base64.b64decode(m[2],validate=True)
+            signatures={'png':raw.startswith(b'\x89PNG\r\n\x1a\n'),'jpeg':raw.startswith(b'\xff\xd8\xff'),'webp':raw.startswith(b'RIFF') and raw[8:12]==b'WEBP'}
+            if len(raw)>200000 or not signatures[m[1]]: fail(422,'Некорректный логотип или размер больше 200 КБ')
+        except (binascii.Error,ValueError): fail(422,'Некорректный логотип')
+    with db(True) as c:
+        if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Мероприятие не найдено')
+        if v.archived and c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]==eid: fail(409,'Сначала выберите другое мероприятие')
+        c.execute('INSERT INTO event_meta VALUES(?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET archived=excluded.archived,template=excluded.template,brand=excluded.brand,accent=excluded.accent,logo=excluded.logo',(eid,int(v.archived),int(v.template),v.brand.strip(),v.accent,v.logo))
+        audit(c,'Настройки мероприятия',eid)
+    return {'ok':True}
+
+@app.put('/api/admin/terminal/{tid}',dependencies=[Depends(admin)])
+def configure_terminal(tid:str,v:TerminalConfig):
+    if not re.fullmatch(r'[a-f0-9]{32}',tid): fail(422,'Некорректный идентификатор')
+    with db(True) as c:
+        if v.event_id is not None and not c.execute('SELECT 1 FROM events WHERE id=?',(v.event_id,)).fetchone(): fail(404,'Мероприятие не найдено')
+        c.execute('INSERT INTO terminal_config VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET label=excluded.label,locked=excluded.locked,event_id=excluded.event_id,revision=terminal_config.revision+excluded.revision',(tid,v.label.strip(),int(v.locked),v.event_id,int(v.reload)))
+        audit(c,'Настройка терминала',tid[-8:])
+    return {'ok':True}
+
+@app.patch('/api/admin/live',dependencies=[Depends(admin)])
+def live_control(v:LiveControl):
+    # Serialize read/modify/write with normal stage control.
+    with WRITE_LOCK:
+        with db() as c:
+            s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
+            opened=effective_open(c,s) if v.opened is None else v.opened
+            target_round=s['active_round'] if v.round is None else v.round
+        return control(Control(event=s['active_event'],round=target_round,opened=opened,display=v.display if v.display is not None else s['display'],duration=v.duration))
+
+@app.get('/api/admin/audit',dependencies=[Depends(admin)])
+def audit_history():
+    with db() as c: return {'entries':[dict(r) for r in c.execute('SELECT created,action,detail FROM audit_log ORDER BY id DESC LIMIT 200')]}
+
+@app.get('/api/admin/diagnostics',dependencies=[Depends(admin)])
+def diagnostics():
+    with db() as c:
+        status=c.execute('PRAGMA quick_check').fetchone()[0]
+        s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
+        db_ok=status=='ok'
+        end=deadline(c)
+    disk=shutil.disk_usage(DB.parent)
+    return {'version':VERSION,'database_ok':db_ok,'disk_free':disk.free,'disk_total':disk.total,'opened':effective_open_for(s,end),'deadline':end,'update':update_status(),'terminals':terminal_status()['online'],'access_required':access_required()}
+
+def effective_open_for(s,end):
+    return bool(s['opened'] and (end is None or end>time.time()))
+
+@app.get('/api/admin/qr',dependencies=[Depends(admin)])
+def terminal_qr(url:str):
+    from urllib.parse import urlsplit
+    import qrcode
+    import qrcode.image.svg
+    u=urlsplit(url)
+    if len(url)>512 or u.scheme not in ('http','https') or not u.hostname or u.username or u.password or u.query or u.fragment or u.path!='/vote': fail(422,'Укажите адрес терминала без ключа')
+    out=io.BytesIO()
+    qrcode.make(url,image_factory=qrcode.image.svg.SvgPathImage).save(out)
+    return Response(out.getvalue(),media_type='image/svg+xml')
+
+@app.get('/api/admin/report/{eid}/{fmt}',dependencies=[Depends(admin)])
+def report(eid:int,fmt:Literal['pdf','xlsx']):
+    from reports import make_report
+    with db() as c:
+        e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+        if not e: fail(404,'Мероприятие не найдено')
+        qs=questions(e)
+        rows=[(r['name'],results(c,r['id'],qs)) for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,))]
+    data,media=make_report(e['title'],qs,rows,fmt)
+    return Response(data,media_type=media,headers={'Content-Disposition':f'attachment; filename="votemera-{eid}.{fmt}"'})
 
 init()
