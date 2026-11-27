@@ -749,7 +749,7 @@ def update_busy():
     return UPDATE_REQUEST.exists() or update_status()=='running'
 
 @app.get('/api/admin/update',dependencies=[Depends(admin)])
-def update_info(check: bool=False):
+def update_info(check: bool=False,log: bool=False):
     status=update_status()
     info=dict(version=VERSION,status='queued' if UPDATE_REQUEST.exists() else status,available=None,latest=None)
     if check and status!='unavailable' and not update_busy():
@@ -759,6 +759,17 @@ def update_info(check: bool=False):
             info.update(available=version_tuple(release['version'])>version_tuple(VERSION),latest=release['version'])
         except (OSError,subprocess.SubprocessError,ValueError,KeyError):
             info['error']='Не удалось проверить GitHub. Проверьте подключение к интернету.'
+    if log:
+        # The root service writes a fixed file, never arbitrary journal output or credentials.
+        path=UPDATE_STATUS.with_name('update.log')
+        try:
+            with path.open('rb') as f:
+                end=f.seek(0,os.SEEK_END); start=max(0,end-65536); f.seek(start)
+                data=f.read(65536)
+            info['log']=data.decode('utf-8',errors='replace')
+            info['log_truncated']=start>0
+        except OSError:
+            info['log']=''; info['log_truncated']=False
     return info
 
 @app.post('/api/admin/update',dependencies=[Depends(admin)])
