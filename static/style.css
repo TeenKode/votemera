@@ -175,3 +175,5 @@ body[data-mode=display][data-connection=offline] .screen-stage:after{content:'Н
 /* If a screen is particularly short, retain a real minimum touch area and let the outer fitter scale the entire page. */
 .screen-stage .vote-main>.choices{min-height:calc(var(--choice-rows,2)*48px + (var(--choice-rows,2) - 1)*8px)}
 @media(max-width:480px){.screen-stage .vote-main>.choices.choices-2.choice-grid{--choice-rows:2!important}}
+
+.external-link{display:inline-block;background:var(--accent);color:#09272a;padding:20px 28px;border-radius:14px;font-size:clamp(20px,4vmin,44px);font-weight:800;text-decoration:none}.external-status{font-size:clamp(12px,1.8vmin,18px);margin:0}
