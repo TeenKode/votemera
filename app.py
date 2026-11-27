@@ -2,6 +2,7 @@ import asyncio
 import csv
 import hmac
 import hashlib
+import secrets
 import io
 import json
 import os
@@ -53,6 +54,63 @@ def db(write=False, transaction=True):
             c.rollback(); raise
         finally: c.close()
 
+ACCESS_LOCK = threading.RLock()
+PASSWORD_ROUNDS = 240000
+KEY_ROUNDS = 120000
+
+@contextmanager
+def access_db(write=False):
+    with ACCESS_LOCK:
+        path=DB.with_name(DB.name+'.access')
+        c=sqlite3.connect(path,timeout=10)
+        c.row_factory=sqlite3.Row
+        try:
+            os.chmod(path,0o600)
+            if write: c.execute('BEGIN IMMEDIATE')
+            yield c
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+        finally: c.close()
+
+def password_hash(value,salt,rounds=PASSWORD_ROUNDS):
+    return hashlib.pbkdf2_hmac('sha256',value.encode('utf-8'),salt,rounds).hex()
+
+def init_access():
+    with access_db(True) as c:
+        c.execute('CREATE TABLE IF NOT EXISTS access_settings(id INTEGER PRIMARY KEY CHECK(id=1),password_salt BLOB NOT NULL,password_hash TEXT NOT NULL,key_salt BLOB NOT NULL,required INTEGER NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS terminal_keys(id INTEGER PRIMARY KEY,label TEXT NOT NULL,digest TEXT UNIQUE NOT NULL,created REAL NOT NULL,enabled INTEGER NOT NULL DEFAULT 1)')
+        if c.execute('SELECT 1 FROM access_settings WHERE id=1').fetchone(): return
+        salt=secrets.token_bytes(32); key_salt=secrets.token_bytes(32)
+        c.execute('INSERT INTO access_settings VALUES(1,?,?,?,?)',(salt,password_hash(ADMIN,salt) if ADMIN else '',key_salt,int(bool(TERMINAL))))
+        if TERMINAL:
+            c.execute('INSERT INTO terminal_keys(label,digest,created) VALUES(?,?,?)',('Первоначальный ключ',password_hash(TERMINAL,key_salt,KEY_ROUNDS),time.time()))
+
+def access_required():
+    with access_db() as c:
+        return bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0])
+
+def verify_admin(value):
+    with access_db() as c:
+        row=c.execute('SELECT password_salt,password_hash FROM access_settings WHERE id=1').fetchone()
+    if not row['password_hash']: fail(503,'Пароль администратора не настроен на сервере')
+    return bool(len(value)<=512 and secret_eq(password_hash(value,row['password_salt']),row['password_hash']))
+
+def set_admin_password(value):
+    salt=secrets.token_bytes(32)
+    with access_db(True) as c:
+        c.execute('UPDATE access_settings SET password_salt=?,password_hash=? WHERE id=1',(salt,password_hash(value,salt)))
+
+def terminal_digest(c,value):
+    salt=c.execute('SELECT key_salt FROM access_settings WHERE id=1').fetchone()[0]
+    return password_hash(value,salt,KEY_ROUNDS)
+
+def checked_secret(value,minimum=8):
+    if not minimum<=len(value)<=128 or any(not 33<=ord(ch)<=126 for ch in value):
+        fail(422,'Используйте от '+str(minimum)+' до 128 латинских букв, цифр или символов без пробелов')
+    return value
+
 def init():
     with db(transaction=False) as c:
         c.execute('PRAGMA journal_mode=WAL')
@@ -87,25 +145,31 @@ def init():
             r=c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(e,'До педсовета',0)).lastrowid
             c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(e,'После педсовета',1))
             c.execute('UPDATE settings SET active_event=?,active_round=? WHERE id=1 AND active_event IS NULL',(e,r))
+    init_access()
 
 def fail(status,msg): raise HTTPException(status,msg)
 def secret_eq(a,b): return hmac.compare_digest(a.encode(),b.encode())
 def admin(request: Request, authorization: str = Header(default='')):
-    if not ADMIN: fail(503,'Пароль администратора не настроен на сервере')
     address=request.client.host if request.client else 'unknown'
     now=time.monotonic()
     with AUTH_LOCK:
         n,until=AUTH_FAILURES.get(address,(0,0))
         if until<=now: n=0; until=now+60
         if n>=10: fail(429,'Слишком много попыток входа. Повторите через минуту.')
-        if not secret_eq(authorization,'Bearer '+ADMIN):
+        if not authorization.startswith('Bearer ') or not verify_admin(authorization[7:]):
             AUTH_FAILURES[address]=(n+1,until)
             AUTH_FAILURES.move_to_end(address)
             while len(AUTH_FAILURES)>4096: AUTH_FAILURES.popitem(last=False)
             fail(401,'Неверный пароль')
         AUTH_FAILURES.pop(address,None)
 def terminal(x_terminal_key: str = Header(default='')):
-    if TERMINAL and not secret_eq(x_terminal_key,TERMINAL): fail(403,'Неверный ключ терминала')
+    with access_db() as c:
+        required=c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]
+        if not required: return None
+        if not x_terminal_key or len(x_terminal_key)>512: fail(403,'Неверный ключ терминала')
+        row=c.execute('SELECT id FROM terminal_keys WHERE digest=? AND enabled=1',(terminal_digest(c,x_terminal_key),)).fetchone()
+        if not row: fail(403,'Неверный или отключённый ключ терминала')
+        return row['id']
 
 def clean(s):
     s=s.strip()
@@ -162,6 +226,21 @@ class Presentation(BaseModel):
     order: list[int] = Field(default_factory=list,max_length=12)
     slides: list[Slide] = Field(default_factory=list,max_length=24)
     seconds: int = Field(default=15,ge=5,le=120)
+
+class PasswordChange(BaseModel):
+    current: str = Field(max_length=512)
+    password: str = Field(min_length=8,max_length=128)
+
+class KeyCreate(BaseModel):
+    label: str = Field(min_length=1,max_length=80)
+    key: str | None = Field(default=None,max_length=128)
+
+class KeyEdit(BaseModel):
+    label: str = Field(min_length=1,max_length=80)
+    enabled: bool
+
+class KeyRotate(BaseModel):
+    key: str | None = Field(default=None,max_length=128)
 
 class TerminalHeartbeat(BaseModel):
     terminal: str = Field(pattern=r'^[a-f0-9]{32}$')
@@ -232,7 +311,7 @@ def snapshot(c, private=False, voting=False):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
     cfg=DEFAULTS | json.loads(s['data'])
     e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
-    result=dict(settings=cfg, event=None, round=s['active_round'], opened=bool(s['opened']), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=bool(TERMINAL))
+    result=dict(settings=cfg, event=None, round=s['active_round'], opened=bool(s['opened']), epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
     if e:
         qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs)
         for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(e['id'],)):
@@ -247,7 +326,7 @@ def snapshot(c, private=False, voting=False):
         if private or (not voting and s['display'] in ('analysis','analysis_compare','presentation')): result['event']['analysis']=ac
         if not voting: result['event']['presentation']=presentation_config(c,e['id'],qs)
     if private:
-        result['events']=[dict(x) for x in c.execute('SELECT id,title,question,created FROM events ORDER BY id DESC')]
+        result['events']=[dict(x) for x in c.execute('SELECT e.id,e.title,e.question,e.created,(SELECT count(*) FROM rounds WHERE event_id=e.id) AS round_count,(SELECT count(*) FROM votes v JOIN rounds r ON r.id=v.round_id WHERE r.event_id=e.id AND v.question_index=0) AS total FROM events e ORDER BY e.id DESC')]
     return result
 
 app=FastAPI(title='Votemera',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None)
@@ -340,22 +419,78 @@ def ballot(v:Ballot):
         c.executemany('INSERT INTO votes(round_id,choice,nonce,terminal,created,question_index,ballot_id) VALUES(?,?,?,?,?,?,?)',[(v.round,n,nonces[i],v.terminal,now,i,v.nonce) for i,n in enumerate(v.choices) if n is not None])
     return {'ok':True,'duplicate':False}
 
-@app.post('/api/terminal/heartbeat',dependencies=[Depends(terminal)])
-def heartbeat(v:TerminalHeartbeat):
+@app.post('/api/terminal/heartbeat')
+def heartbeat(v:TerminalHeartbeat,key_id=Depends(terminal)):
     now=time.monotonic()
     with TERMINALS_LOCK:
-        TERMINALS[v.terminal]=now
+        TERMINALS[v.terminal]=(now,key_id)
         TERMINALS.move_to_end(v.terminal)
-        while TERMINALS and (len(TERMINALS)>4096 or next(iter(TERMINALS.values()))<now-300):
+        while TERMINALS and (len(TERMINALS)>4096 or next(iter(TERMINALS.values()))[0]<now-300):
             TERMINALS.popitem(last=False)
     return {'ok':True}
 
 @app.get('/api/admin/terminals',dependencies=[Depends(admin)])
 def terminal_status():
     now=time.monotonic()
+    with access_db() as c:
+        names={r['id']:r['label'] for r in c.execute('SELECT id,label FROM terminal_keys WHERE enabled=1')}
+        required=bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0])
     with TERMINALS_LOCK:
-        rows=[dict(id=k[-8:],seconds_ago=int(now-t),online=now-t<25) for k,t in reversed(TERMINALS.items()) if now-t<300]
+        rows=[dict(id=k[-8:],seconds_ago=int(now-t),online=now-t<25 and (kid in names or (kid is None and not required)),key_name=names.get(kid,'Без ключа' if kid is None else 'Ключ отозван')) for k,(t,kid) in reversed(TERMINALS.items()) if now-t<300]
     return {'online':sum(r['online'] for r in rows),'terminals':rows}
+
+@app.put('/api/admin/password',dependencies=[Depends(admin)])
+def change_password(v:PasswordChange):
+    value=checked_secret(v.password)
+    with ACCESS_LOCK:
+        if not verify_admin(v.current): fail(403,'Текущий пароль неверен')
+        set_admin_password(value)
+    return {'ok':True}
+
+@app.get('/api/admin/keys',dependencies=[Depends(admin)])
+def list_keys():
+    with access_db() as c:
+        return {'required':bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]),'keys':[dict(r) for r in c.execute('SELECT id,label,created,enabled FROM terminal_keys ORDER BY id')]}
+
+@app.post('/api/admin/keys',dependencies=[Depends(admin)])
+def create_key(v:KeyCreate):
+    value=checked_secret(v.key if v.key is not None else secrets.token_hex(16))
+    with access_db(True) as c:
+        if c.execute('SELECT count(*) FROM terminal_keys').fetchone()[0]>=100: fail(409,'Максимум 100 ключей')
+        try:
+            kid=c.execute('INSERT INTO terminal_keys(label,digest,created) VALUES(?,?,?)',(clean(v.label),terminal_digest(c,value),time.time())).lastrowid
+        except sqlite3.IntegrityError: fail(409,'Такой ключ уже существует')
+        c.execute('UPDATE access_settings SET required=1 WHERE id=1')
+    return {'id':kid,'key':value}
+
+def forget_key_terminals(kid):
+    with TERMINALS_LOCK:
+        for terminal_id,(_,key_id) in list(TERMINALS.items()):
+            if key_id==kid: TERMINALS.pop(terminal_id,None)
+
+@app.put('/api/admin/keys/{kid}',dependencies=[Depends(admin)])
+def edit_key(kid:int,v:KeyEdit):
+    with access_db(True) as c:
+        if not c.execute('UPDATE terminal_keys SET label=?,enabled=? WHERE id=?',(clean(v.label),int(v.enabled),kid)).rowcount: fail(404,'Ключ не найден')
+    if not v.enabled: forget_key_terminals(kid)
+    return {'ok':True}
+
+@app.post('/api/admin/keys/{kid}/rotate',dependencies=[Depends(admin)])
+def rotate_key(kid:int,v:KeyRotate):
+    value=checked_secret(v.key if v.key is not None else secrets.token_hex(16))
+    with access_db(True) as c:
+        try:
+            if not c.execute('UPDATE terminal_keys SET digest=? WHERE id=?',(terminal_digest(c,value),kid)).rowcount: fail(404,'Ключ не найден')
+        except sqlite3.IntegrityError: fail(409,'Такой ключ уже существует')
+    forget_key_terminals(kid)
+    return {'id':kid,'key':value}
+
+@app.delete('/api/admin/keys/{kid}',dependencies=[Depends(admin)])
+def delete_key(kid:int):
+    with access_db(True) as c:
+        if not c.execute('DELETE FROM terminal_keys WHERE id=?',(kid,)).rowcount: fail(404,'Ключ не найден')
+    forget_key_terminals(kid)
+    return {'ok':True}
 
 @app.get('/api/admin/state',dependencies=[Depends(admin)])
 def admin_state():
@@ -386,6 +521,19 @@ def edit_event(eid:int,e:Event):
         c.execute('DELETE FROM rounds WHERE event_id=?',(eid,)); ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(eid,n,i)).lastrowid for i,n in enumerate(names)]
         if s['active_event']==eid: c.execute('UPDATE settings SET active_round=?,epoch=? WHERE id=1',(ids[0],uuid4().hex))
     return {'id':eid,'round':ids[0]}
+@app.delete('/api/admin/event/{eid}',dependencies=[Depends(admin)])
+def delete_event(eid:int,confirm_results:bool=False):
+    with db(True) as c:
+        if not c.execute('SELECT 1 FROM events WHERE id=?',(eid,)).fetchone(): fail(404,'Мероприятие не найдено')
+        if c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]==eid: fail(409,'Сначала выберите другое активное мероприятие')
+        if not confirm_results and c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Подтвердите удаление результатов')
+        c.execute('DELETE FROM events WHERE id=?',(eid,))
+    return {'ok':True}
+
+@app.post('/api/admin/event/{eid}/copy',dependencies=[Depends(admin)])
+def copy_event(eid:int):
+    return clone_event(eid,'Копия: ')
+
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
     with db(True) as c:
@@ -417,10 +565,13 @@ def set_presentation(eid:int,v:Presentation):
 
 @app.post('/api/admin/rehearsal/{eid}',dependencies=[Depends(admin)])
 def rehearsal(eid:int):
+    return clone_event(eid,'[Репетиция] ')
+
+def clone_event(eid:int,prefix:str):
     with db(True) as c:
         e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e: fail(404,'Мероприятие не найдено')
-        new=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',('[Репетиция] '+e['title'][:105],e['question'],e['options'],time.time(),e['questions'])).lastrowid
+        new=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',(prefix+e['title'][:120-len(prefix)],e['question'],e['options'],time.time(),e['questions'])).lastrowid
         ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(new,r['name'],r['position'])).lastrowid for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,)).fetchall()]
         for name,columns in [('analysis_config','first_q,second_q,chart'),('presentation_config','data')]:
             c.execute(f'INSERT INTO {name}(event_id,{columns}) SELECT ?,{columns} FROM {name} WHERE event_id=?',(new,eid))
