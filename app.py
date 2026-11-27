@@ -395,7 +395,7 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.middleware('http')
 async def headers(request, call_next):
     r=await call_next(request)
-    r.headers['Cache-Control']='no-store'
+    r.headers.setdefault('Cache-Control','no-store')
     r.headers['X-Content-Type-Options']='nosniff'
     r.headers['X-Frame-Options']='DENY'
     r.headers['Referrer-Policy']='no-referrer'

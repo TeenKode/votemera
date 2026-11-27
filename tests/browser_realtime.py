@@ -83,10 +83,19 @@ with httpx.Client(timeout=10) as api:
         expect(fallback.locator('#connection')).to_have_attribute('data-transport','sse',timeout=30000)
         assert submit(s,[1]).is_success
         expect(fallback.locator('.total-number')).to_have_text('55',timeout=10000)
+        # An apparently open connection that stops sending messages is also detected.
+        silent=browser.new_page()
+        silent.add_init_script("""(()=>{const Real=window.EventSource;window.EventSource=class extends Real{constructor(...args){super(...args);this._first=true;this._frozen=false;this._real=event=>{if(this._first){this._first=false;this._handler?.(event);this._frozen=true;}};super.addEventListener('message',this._real)}set onmessage(fn){this._handler=fn}get onmessage(){return this._handler}addEventListener(name,fn,...rest){if(name==='heartbeat')return;return super.addEventListener(name,fn,...rest)}}})()""")
+        silent.goto(BASE+'/display')
+        expect(silent.locator('.total-number')).to_have_text('55')
+        assert submit(s,[0]).is_success
+        expect(silent.locator('#connection')).to_have_attribute('data-transport','poll',timeout=15000)
+        expect(silent.locator('.total-number')).to_have_text('56',timeout=10000)
+        silent.close()
         # Closing/hiding and changing the stage must update all clients.
         assert api.post(BASE+'/api/admin/control',headers=AUTH,json=dict(event=e['id'],round=e['round'],opened=False,display='hidden')).is_success
         expect(display.get_by_role('heading',name='Результаты пока скрыты')).to_be_visible()
         expect(vote.get_by_role('heading',name='Голосование закрыто')).to_be_visible()
         assert not errors,errors
         browser.close()
-        print('Realtime, 50 concurrent ballots, recovery and touch layout: OK')
+        print('Realtime, 50 ballots (12 parallel workers), recovery and touch layout: OK')
