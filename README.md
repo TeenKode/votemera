@@ -16,16 +16,15 @@
 
 Создайте непривилегированный Debian 13 LXC: 1 vCPU, 512 МБ–1 ГБ RAM, 4–8 ГБ диска, сетевой мост в локальную сеть, статический IP или DHCP reservation. Установку выполняйте **внутри контейнера**, не на хосте Proxmox.
 
-После публикации этого репозитория на GitHub (замените URL на фактический):
+Репозиторий публичный. Выполните команды от root; логин, пароль и токен GitHub не нужны:
 
 ```bash
-apt-get update && apt-get install -y git
-git clone https://github.com/OWNER/votemera.git /opt/votemera
-cd /opt/votemera
-bash scripts/install.sh
+apt-get update && apt-get install -y git ca-certificates && \
+GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ASKPASS=/bin/false git -c credential.helper= clone --branch main https://github.com/TeenKode/votemera.git /opt/votemera && \
+cd /opt/votemera && bash scripts/install.sh
 ```
 
-Установщик создаёт пользователя `votemera`, виртуальное окружение, конфигурацию с случайными паролем администратора и ключом терминалов, службу systemd с автозапуском, папку данных. В конце выводит оба секрета. Для закрытого репозитория сначала настройте доступ Git через SSH/deploy key. Порт по умолчанию 8080.
+Установщик создаёт пользователя `votemera`, виртуальное окружение, конфигурацию с случайными паролем администратора и ключом терминалов, службу systemd с автозапуском, папку данных. В конце выводит оба секрета. Если GitHub недоступен, установка завершится с ошибкой до запуска установщика; не вводите пароль или токен. Для диагностики выполните `GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/TeenKode/votemera.git refs/heads/main` и проверьте сетевую доступность GitHub. Порт по умолчанию 8080.
 
 | Адрес | Назначение |
 |---|---|

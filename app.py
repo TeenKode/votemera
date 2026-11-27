@@ -470,7 +470,7 @@ def update_info(check: bool=False):
     if check and status!='unavailable' and not update_busy():
         try:
             local=subprocess.check_output(['git','-c',f'safe.directory={ROOT}','-C',str(ROOT),'rev-parse','HEAD'],text=True,timeout=5).strip()
-            remote=subprocess.check_output(['git','ls-remote',UPDATE_REMOTE,'refs/heads/main'],text=True,timeout=12).split()
+            remote=subprocess.check_output(['git','-c','credential.helper=','ls-remote',UPDATE_REMOTE,'refs/heads/main'],text=True,timeout=12,env={**os.environ,'GIT_TERMINAL_PROMPT':'0','GIT_ASKPASS':'/bin/false','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null'}).split()
             if not remote or not re.fullmatch(r'[a-f0-9]{40}',remote[0]): raise ValueError('Invalid remote ref')
             info.update(available=local!=remote[0],latest=remote[0][:10])
         except (OSError,subprocess.SubprocessError,ValueError):

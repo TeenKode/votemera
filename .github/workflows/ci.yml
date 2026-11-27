@@ -5,6 +5,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify anonymous access to public repository
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_ASKPASS: /bin/false
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+        run: git -c credential.helper= ls-remote --exit-code https://github.com/TeenKode/votemera.git refs/heads/main
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
