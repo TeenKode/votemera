@@ -76,6 +76,7 @@ def init():
             c.commit()
         c.execute('CREATE INDEX IF NOT EXISTS votes_ballot ON votes(round_id,ballot_id,question_index)')
         c.execute('CREATE TABLE IF NOT EXISTS analysis_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE, first_q INTEGER NOT NULL, second_q INTEGER NOT NULL, chart TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS presentation_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,data TEXT NOT NULL)')
         c.execute('CREATE INDEX IF NOT EXISTS votes_question ON votes(round_id,question_index,choice)')
         c.execute('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)',(json.dumps(DEFAULTS),))
         if not c.execute('SELECT 1 FROM events LIMIT 1').fetchone():
@@ -141,11 +142,19 @@ class Control(BaseModel):
     event: int
     round: int
     opened: bool
-    display: Literal['live','compare','hidden','analysis','analysis_compare']
+    display: Literal['live','compare','hidden','analysis','analysis_compare','presentation']
 class AnalysisConfig(BaseModel):
     first: int = Field(ge=0,le=11)
     second: int = Field(ge=0,le=11)
     chart: Literal['stack','heatmap'] = 'stack'
+
+class Slide(BaseModel):
+    mode: Literal['live','compare','analysis','analysis_compare']
+    question: int = Field(default=-1,ge=-1,le=11)
+class Presentation(BaseModel):
+    order: list[int] = Field(default_factory=list,max_length=12)
+    slides: list[Slide] = Field(default_factory=list,max_length=24)
+    seconds: int = Field(default=15,ge=5,le=120)
 
 class TerminalHeartbeat(BaseModel):
     terminal: str = Field(pattern=r'^[a-f0-9]{32}
@@ -202,6 +211,10 @@ def cross_results(c,rid,qs,first,second):
     submitted=c.execute('SELECT count(*) FROM votes WHERE round_id=? AND question_index=0',(rid,)).fetchone()[0]
     return dict(matrix=matrix,totals=totals,total=sum(totals),unpaired=max(0,submitted-sum(totals)))
 
+def presentation_config(c,eid,qs):
+    row=c.execute('SELECT data FROM presentation_config WHERE event_id=?',(eid,)).fetchone()
+    return json.loads(row['data']) if row else dict(order=list(range(len(qs))),slides=[],seconds=15)
+
 def snapshot(c, private=False, voting=False):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
     cfg=DEFAULTS | json.loads(s['data'])
@@ -211,14 +224,15 @@ def snapshot(c, private=False, voting=False):
         qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs)
         for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(e['id'],)):
             item=dict(id=r['id'],name=r['name'])
-            if private or (not voting and s['display']!='hidden' and (s['display'] in ('compare','analysis_compare') or r['id']==s['active_round'])):
+            if private or (not voting and s['display']!='hidden' and (s['display'] in ('compare','analysis_compare','presentation') or r['id']==s['active_round'])):
                 rs=results(c,r['id'],qs)
                 item.update(counts=rs[0]['counts'],total=rs[0]['total'],results=rs)
-                if ac and (private or s['display'] in ('analysis','analysis_compare')):
+                if ac and (private or s['display'] in ('analysis','analysis_compare','presentation')):
                     item['cross']=cross_results(c,r['id'],qs,ac['first'],ac['second'])
             rounds.append(item)
         result['event']=dict(id=e['id'],title=e['title'],question=e['question'],options=options,questions=qs,rounds=rounds)
-        if private or (not voting and s['display'] in ('analysis','analysis_compare')): result['event']['analysis']=ac
+        if private or (not voting and s['display'] in ('analysis','analysis_compare','presentation')): result['event']['analysis']=ac
+        if not voting: result['event']['presentation']=presentation_config(c,e['id'],qs)
     if private:
         result['events']=[dict(x) for x in c.execute('SELECT id,title,question,created FROM events ORDER BY id DESC')]
     return result
@@ -344,6 +358,7 @@ def edit_event(eid:int,e:Event):
         if (s['active_event']==eid and s['opened']) or c.execute('SELECT 1 FROM votes JOIN rounds ON rounds.id=votes.round_id WHERE event_id=? LIMIT 1',(eid,)).fetchone(): fail(409,'Редактирование доступно только до начала голосования или после очистки всех этапов')
         c.execute('UPDATE events SET title=?,question=?,options=?,questions=? WHERE id=?',(clean(e.title),qs[0]['question'],json.dumps(qs[0]['options'],ensure_ascii=False),json.dumps(qs,ensure_ascii=False),eid))
         c.execute('DELETE FROM analysis_config WHERE event_id=?',(eid,))
+        c.execute('DELETE FROM presentation_config WHERE event_id=?',(eid,))
         c.execute('DELETE FROM rounds WHERE event_id=?',(eid,)); ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(eid,n,i)).lastrowid for i,n in enumerate(names)]
         if s['active_event']==eid: c.execute('UPDATE settings SET active_round=?,epoch=? WHERE id=1',(ids[0],uuid4().hex))
     return {'id':eid,'round':ids[0]}
@@ -364,6 +379,28 @@ def set_analysis(eid:int,v:AnalysisConfig):
         if v.first==v.second or max(v.first,v.second)>=len(questions(e)): fail(422,'Выберите два разных вопроса')
         c.execute('INSERT INTO analysis_config VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET first_q=excluded.first_q,second_q=excluded.second_q,chart=excluded.chart',(eid,v.first,v.second,v.chart))
     return {'ok':True}
+
+@app.put('/api/admin/presentation/{eid}',dependencies=[Depends(admin)])
+def set_presentation(eid:int,v:Presentation):
+    with db(True) as c:
+        e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+        if not e: fail(404,'Мероприятие не найдено')
+        n=len(questions(e))
+        if len(set(v.order))!=len(v.order) or any(not 0<=i<n for i in v.order): fail(422,'Неверный порядок вопросов')
+        if any(s.question>=n or (s.mode.startswith('analysis') and n<2) for s in v.slides): fail(422,'Неверный слайд')
+        c.execute('INSERT INTO presentation_config VALUES(?,?) ON CONFLICT(event_id) DO UPDATE SET data=excluded.data',(eid,json.dumps(v.model_dump())))
+    return {'ok':True}
+
+@app.post('/api/admin/rehearsal/{eid}',dependencies=[Depends(admin)])
+def rehearsal(eid:int):
+    with db(True) as c:
+        e=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+        if not e: fail(404,'Мероприятие не найдено')
+        new=c.execute('INSERT INTO events(title,question,options,created,questions) VALUES(?,?,?,?,?)',('[Репетиция] '+e['title'][:105],e['question'],e['options'],time.time(),e['questions'])).lastrowid
+        ids=[c.execute('INSERT INTO rounds(event_id,name,position) VALUES(?,?,?)',(new,r['name'],r['position'])).lastrowid for r in c.execute('SELECT * FROM rounds WHERE event_id=? ORDER BY position',(eid,)).fetchall()]
+        for name,columns in [('analysis_config','first_q,second_q,chart'),('presentation_config','data')]:
+            c.execute(f'INSERT INTO {name}(event_id,{columns}) SELECT ?,{columns} FROM {name} WHERE event_id=?',(new,eid))
+    return {'id':new,'round':ids[0]}
 
 @app.put('/api/admin/settings',dependencies=[Depends(admin)])
 def settings(v:Settings):
