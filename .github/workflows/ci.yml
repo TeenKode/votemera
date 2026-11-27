@@ -25,7 +25,8 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python scripts/check-release-version.py "$BASE_SHA" HEAD
-      - run: pip install --require-hashes --only-binary=:all: -r requirements.lock
+      - run: |
+          pip install --require-hashes --only-binary=:all: -r requirements.lock
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q
       - run: node --check static/app.js
