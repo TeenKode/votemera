@@ -334,7 +334,7 @@ def effective_open(c,s):
 def terminal_allowed(c,tid,eid):
     t=c.execute('SELECT locked,event_id FROM terminal_config WHERE id=?',(tid,)).fetchone()
     if t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=eid)):
-        fail(403,'Терминал заблокирован или назначен другому мероприятию')
+        fail(423,'Терминал заблокирован или назначен другому мероприятию')
 
 def snapshot(c, private=False, voting=False):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
