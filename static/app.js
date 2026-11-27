@@ -1,6 +1,39 @@
 'use strict';
 document.body.dataset.mode=location.pathname.slice(1)||'home';
 const $=id=>document.getElementById(id), main=$('main'), mode=location.pathname.slice(1)||'home';
+// Only public screens are fitted. Admin keeps normal scrolling.
+const kiosk=mode==='vote'||mode==='display';
+let fitStage=null,fitFrame=0,fitViewport='',fitScale=1;
+function scheduleFit(){if(kiosk&&!fitFrame)fitFrame=requestAnimationFrame(fitScreen)}
+function fitScreen(){
+ fitFrame=0;if(!fitStage||!fitStage.clientWidth||!fitStage.clientHeight)return;
+ const w=fitStage.clientWidth,h=fitStage.clientHeight;
+ const size=w+':'+h;
+ if(fitViewport!==size){fitViewport=size;if(mode==='display'&&state)renderDisplay()}
+ // Layout dimensions are untransformed, so shrinking never feeds back into measurement.
+ const width=Math.max(main.offsetWidth,main.scrollWidth),height=Math.max(main.offsetHeight,main.scrollHeight);
+ const scale=Math.min(1,w/Math.max(1,width),h/Math.max(1,height));
+ if(Math.abs(scale-fitScale)>.0001){fitScale=scale;main.style.setProperty('--screen-scale',String(scale))}
+ main.dataset.fit=scale<.999?'scaled':'natural';
+}
+function initFit(){
+ if(!kiosk)return;
+ fitStage=document.createElement('div');fitStage.className='screen-stage';main.before(fitStage);fitStage.append(main);
+ if('ResizeObserver' in window){const observer=new ResizeObserver(scheduleFit);observer.observe(fitStage);observer.observe(main)}
+ new MutationObserver(scheduleFit).observe(main,{childList:true,characterData:true,subtree:true});
+ window.addEventListener('resize',scheduleFit);document.addEventListener('fullscreenchange',scheduleFit);
+ window.visualViewport?.addEventListener('resize',scheduleFit);
+ document.fonts?.ready.then(scheduleFit);
+ scheduleFit();
+}
+function screenPageSize(s,ordered,roundCount){
+ const preferred=s.settings.display_page_size||4;
+ const w=fitStage?.clientWidth||innerWidth,h=fitStage?.clientHeight||innerHeight;
+ const dense=ordered.some(i=>{const q=s.event.questions[i];return q.options.length>3||q.question.length>120||q.options.some(o=>o.label.length>45)});
+ if(w<680||h<480||roundCount>1)return 1;
+ if(w<1050||h<740||dense)return Math.min(preferred,2);
+ return preferred;
+}
 const el=(tag,cls,txt)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(txt!==undefined)n.textContent=txt;return n};
 const add=(parent,...nodes)=>{parent.append(...nodes);return parent};
 const btn=(txt,fn,cls='secondary')=>{const b=el('button',cls,txt);b.type='button';b.onclick=fn;return b};
@@ -95,7 +128,7 @@ function renderVote(){
  if(q.confirm){const next=btn(answers.length===qs.length-1?'Отправить ответы':'Далее →',()=>accept(selectedChoice),'');next.classList.add('vote-next');next.disabled=selectedChoice===null;nav.append(next)}main.append(nav);
 }
 async function send(v){if(busy)return;busy=true;pending=v;saveDraft();clearTimeout(idleTimer);main.querySelectorAll('button').forEach(b=>b.disabled=true);try{await api('/api/ballot','POST',v);clearDraft();main.replaceChildren(add(el('div','center wait'),el('div','success','✓'),el('h1','',state.settings.thank_you),el('p','muted','Терминал скоро будет готов к следующему участнику')));setTimeout(()=>{busy=false;renderVote()},state.settings.cooldown)}catch(e){busy=false;if(e.status===409||e.status===422){clearDraft()}else if(e.status===403){key='';sessionStorage.removeItem('votemera-key')}if(pending)saveDraft();toast(e.message||'Не удалось подтвердить голос');renderVote()}}
-let displayPage=0,displayPageScope='',rotateTimer=null;
+let displayPage=0,displayPageScope='',rotateTimer=null,crossPage=0,crossScope='',crossTimer=null;
 function crossPanel(s,r){
  const ac=s.event.analysis, a=s.event.questions[ac.first],b=s.event.questions[ac.second],d=r.cross;
  const panel=el('section','question-group cross-panel');panel.append(add(el('div','cross-top'),el('h2','',r.name),el('span','muted',`Анкет: ${d?.total??0}`)));
@@ -113,11 +146,21 @@ function crossPanel(s,r){
  panel.append(el('p','muted cross-note','Доли рассчитаны внутри каждой группы. Связь не доказывает причинность.'+(d.unpaired?` Не включено анкет без связанной пары: ${d.unpaired}.`:'')));return panel;
 }
 function renderCross(s){
- clearInterval(rotateTimer);const ac=s.event.analysis;const sig=JSON.stringify(['cross',s.event.id,s.display,s.round,s.event.questions,ac,s.event.rounds.map(r=>[r.id,r.name])]);const view=el('div');
+ clearInterval(rotateTimer);const ac=s.event.analysis;
+ const allRounds=s.display==='analysis_compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);
+ const crossWidth=fitStage?.clientWidth||innerWidth,crossHeight=fitStage?.clientHeight||innerHeight;
+ const compactPair=ac&&s.event.questions[ac.first].options.length<=3&&s.event.questions[ac.second].options.length<=3&&[s.event.questions[ac.first],s.event.questions[ac.second]].every(q=>q.options.every(o=>o.label.length<=45));
+ const crossSize=compactPair&&crossWidth>=1100&&crossHeight>=600?2:1;const pages=Math.max(1,Math.ceil(allRounds.length/crossSize));
+ const scope=JSON.stringify([s.event.id,s.display,s.round,ac,allRounds.map(r=>r.id),crossSize,s.settings.display_rotate]);
+ if(scope!==crossScope){crossScope=scope;crossPage=0;clearInterval(crossTimer);crossTimer=null}
+ crossPage=Math.min(crossPage,pages-1);
+ const rounds=allRounds.slice(crossPage*crossSize,(crossPage+1)*crossSize);
+ const sig=JSON.stringify(['cross',scope,crossPage,s.event.questions,rounds.map(r=>[r.id,r.name])]);const view=el('div');
  view.append(add(el('div','display-heading'),add(el('div'),el('div','eyebrow','Перекрёстный анализ · '+s.event.title),el('h1','','Связь ответов'))));
  if(!ac){main.dataset.sig=sig;main.className='display-main cross-main';main.replaceChildren(...view.children,el('p','muted','Для анализа необходимо не менее двух вопросов.'));return}
  const a=s.event.questions[ac.first],b=s.event.questions[ac.second];view.append(add(el('div','cross-pair'),add(el('div'),el('small','muted','ГРУППИРОВКА'),el('h2','',a.question)),el('span','cross-arrow','→'),add(el('div'),el('small','muted','РАСПРЕДЕЛЕНИЕ'),el('h2','',b.question))));
- const rounds=s.display==='analysis_compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);const wrap=el('div','cross-rounds');rounds.forEach(r=>wrap.append(crossPanel(s,r)));view.append(wrap);
+ if(pages>1){const nav=el('div','display-nav screen-pager');nav.append(btn('‹',()=>{crossPage=(crossPage+pages-1)%pages;renderDisplay()}),el('span','muted',`Страница ${crossPage+1} / ${pages}`),btn('›',()=>{crossPage=(crossPage+1)%pages;renderDisplay()}));view.append(nav);if(!crossTimer&&s.settings.display_rotate>0)crossTimer=setInterval(()=>{crossPage=(crossPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}
+ const wrap=el('div','cross-rounds');rounds.forEach(r=>wrap.append(crossPanel(s,r)));view.append(wrap);
  if(main.dataset.sig===sig&&main.children.length===view.children.length){[...view.children].forEach((n,i)=>patchView(main.children[i],n))}else{main.dataset.sig=sig;main.className='display-main cross-main';main.replaceChildren(...view.children)}
 }
 function analysisAdmin(parent,s){
@@ -133,19 +176,27 @@ function scenarioState(s){const p=s?.event?.presentation;const active=s?.display
 function renderDisplay(){
  const s=scenarioState(state);if(!s?.event){main.replaceChildren(el('h1','center','Ожидание мероприятия'));return}
  if(['analysis','analysis_compare'].includes(s.display)){renderCross(s);return}
- const qs=s.event.questions, rounds=s.display==='compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);
- const ordered=s.event.presentation?.order?.length?s.event.presentation.order:qs.map((_,i)=>i);const pageSize=s.settings.display_page_size||4, pages=Math.ceil(ordered.length/pageSize);
- const pageScope=JSON.stringify([s.event.id,s.display,pageSize,qs,ordered,s.scenarioQuestion]);if(displayPageScope!==pageScope){displayPageScope=pageScope;displayPage=0;displayFocus=-1}
+ clearInterval(crossTimer);crossTimer=null;crossScope='';
+ const qs=s.event.questions, allRounds=s.display==='compare'?s.event.rounds:s.event.rounds.filter(r=>r.id===s.round);
+ const ordered=s.event.presentation?.order?.length?s.event.presentation.order:qs.map((_,i)=>i);
+ const roundSize=s.display==='compare'?2:1,roundPages=Math.max(1,Math.ceil(allRounds.length/roundSize));
+ const pageSize=screenPageSize(s,ordered,Math.min(roundSize,allRounds.length));
+ const pageScope=JSON.stringify([s.event.id,s.display,qs,ordered,s.scenarioQuestion]);
+ if(displayPageScope!==pageScope){displayPageScope=pageScope;displayPage=0;displayFocus=-1}
  if(displayFocus>=qs.length||(!ordered.includes(displayFocus)&&displayFocus!==-1))displayFocus=-1;if(s.scenarioQuestion>=0)displayFocus=s.scenarioQuestion;
- const indices=displayFocus===-1?ordered.slice(displayPage*pageSize,(displayPage+1)*pageSize):[displayFocus];
- const sig=JSON.stringify([s.event.id,s.event.title,qs,s.display,s.settings,rounds.map(r=>[r.id,r.name]),s.opened,displayFocus,displayPage,ordered,s.scenarioQuestion,s.scenario]);
+ const questionPages=displayFocus===-1?Math.max(1,Math.ceil(ordered.length/pageSize)):1,pages=questionPages*roundPages;
+ displayPage=Math.min(displayPage,pages-1);
+ const questionPage=displayPage%questionPages,roundPage=Math.floor(displayPage/questionPages);
+ const rounds=allRounds.slice(roundPage*roundSize,(roundPage+1)*roundSize);
+ const indices=displayFocus===-1?ordered.slice(questionPage*pageSize,(questionPage+1)*pageSize):[displayFocus];
+ const sig=JSON.stringify([s.event.id,s.event.title,qs,s.display,s.settings,rounds.map(r=>[r.id,r.name]),s.opened,displayFocus,displayPage,ordered,s.scenarioQuestion,s.scenario,pageSize,pages]);
  if(main.dataset.sig===sig){if(s.display!=='hidden'){for(const i of indices){for(const r of rounds)updateChart(r,s,i);updateDelta(s,rounds,i)}updateTotals(rounds)}return}
  clearInterval(rotateTimer);main.dataset.sig=sig;main.className='display-main'+(indices.length===1?' spotlight':'')+(s.display==='compare'?' compare-mode':'');
  const top=el('div','display-heading');const labels=el('div');labels.append(el('div','eyebrow',s.display==='compare'?'Сравнение этапов':s.opened?'Голосование открыто':'Голосование завершено'),el('h1','',s.event.title));top.append(labels);
  main.replaceChildren(top);
  if(s.display==='hidden'){main.append(add(el('div','center wait'),el('h2','','Результаты пока скрыты'),el('p','muted','Они появятся по решению организатора')));return}
  const totals=el('div','display-totals');for(const r of rounds){const tile=el('div','total-tile');tile.append(el('span','',r.name),el('strong','total-number','0'),el('small','','Участников'));tile.dataset.round=r.id;totals.append(tile)}top.append(totals);updateTotals(rounds);
- if(qs.length>1&&!s.scenario){const controls=el('div','display-controls');const picker=select(controls,'Вопрос',[[-1,'Обзор вопросов'],...ordered.map(i=>[i,(i+1)+'. '+qs[i].question])],displayFocus);picker.onchange=()=>{displayFocus=+picker.value;renderDisplay()};if(displayFocus===-1&&pages>1){const nav=el('div','display-nav');nav.append(btn('‹',()=>{displayPage=(displayPage+pages-1)%pages;renderDisplay()}),el('span','muted',`${displayPage+1} / ${pages}`),btn('›',()=>{displayPage=(displayPage+1)%pages;renderDisplay()}));controls.append(nav);if(s.settings.display_rotate>0)rotateTimer=setInterval(()=>{displayPage=(displayPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}main.append(controls)}
+ if((qs.length>1&&!s.scenario)||pages>1){const controls=el('div','display-controls');if(qs.length>1&&!s.scenario){const picker=select(controls,'Вопрос',[[-1,'Обзор вопросов'],...ordered.map(i=>[i,(i+1)+'. '+qs[i].question])],displayFocus);picker.onchange=()=>{displayFocus=+picker.value;displayPage=0;renderDisplay()}}if(pages>1){const nav=el('div','display-nav');nav.append(btn('‹',()=>{displayPage=(displayPage+pages-1)%pages;renderDisplay()}),el('span','muted',`${displayPage+1} / ${pages}`),btn('›',()=>{displayPage=(displayPage+1)%pages;renderDisplay()}));controls.append(nav);if(s.settings.display_rotate>0)rotateTimer=setInterval(()=>{displayPage=(displayPage+1)%pages;renderDisplay()},s.settings.display_rotate*1000)}main.append(controls)}
  const grid=el('div',indices.length>1?'question-grid':'question-single');grid.dataset.size=indices.length;main.append(grid);
  for(const i of indices){const q=qs[i],group=el('section','question-group');group.style.setProperty('--order',indices.indexOf(i));group.append(el('div','question-kicker','ВОПРОС '+String(i+1).padStart(2,'0')),el('h2','',q.question));
  const panels=el('div','round-panels');group.append(panels);grid.append(group);
@@ -201,4 +252,5 @@ function renderEditor(node,e=null){
  const tools=el('div','actions');tools.append(btn('Предпросмотр',()=>{const d=data(),preview=el('dialog','preview-dialog');let idx=0;function show(){const q=d.questions[idx];preview.replaceChildren(el('div','eyebrow',`Вопрос ${idx+1} из ${d.questions.length}`),el('h2','',q.question||'Текст вопроса'),el('p','muted',q.description));if(q.show_if)preview.append(el('p','muted',`Условие: вопрос ${q.show_if.question+1}, вариант ${q.show_if.choice+1}`));const c=el('div','choices choice-grid choices-'+q.options.length);q.options.forEach((o,i)=>{const b=btn(o.label||'Вариант '+(i+1),()=>{},'choice');b.disabled=true;b.style.setProperty('--choice',o.color);c.append(b)});preview.append(c,add(el('div','actions'),btn('←',()=>{idx=Math.max(0,idx-1);show()}),btn('→',()=>{idx=Math.min(d.questions.length-1,idx+1);show()}),btn('Закрыть',()=>preview.close())))}preview.addEventListener('close',()=>preview.remove());document.body.append(preview);show();preview.showModal()}),btn('Экспорт шаблона JSON',()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data(),null,2)],{type:'application/json'})),a=el('a');a.href=url;a.download='votemera-template.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}),btn('Импорт шаблона JSON',()=>{const f=el('input');f.type='file';f.accept='.json,application/json';f.onchange=async()=>{try{const file=f.files[0];if(!file||file.size>100000)throw Error('Файл слишком большой');const d=JSON.parse(await file.text());if(typeof d.title!=='string'||!Array.isArray(d.rounds)||d.rounds.length<1||d.rounds.length>12||!d.rounds.every(x=>typeof x==='string')||!Array.isArray(d.questions)||d.questions.length<1||d.questions.length>12||!d.questions.every(q=>typeof q.question==='string'&&Array.isArray(q.options)&&q.options.length>=2&&q.options.length<=6&&q.options.every(o=>typeof o.label==='string'&&/^#[0-9a-f]{6}$/i.test(o.color))))throw Error('Неверный формат шаблона');if(!confirm('Заменить текущую анкету?'))return;title.value=d.title;rounds.value=d.rounds.join('\n');list.replaceChildren();d.questions.forEach(q=>question(q))}catch(e){toast(e.message)}};f.click()}));node.append(tools,list);
  (e?.questions||[null]).forEach(q=>question(q));node.append(add(el('div','actions editor-save'),btn('+ Вопрос',()=>question()),btn(e?'Сохранить изменения':'Создать',()=>action('/api/admin/event'+(e?'/'+e.id:''),e?'PUT':'POST',data()),''),...(e?[btn('Создать копию мероприятия',()=>{const d=data();d.title+=' — копия';action('/api/admin/event','POST',d)}),btn('Отмена',()=>renderEditor(node))]:[])));
 }
+initFit();
 if(mode==='display'&&new URLSearchParams(location.search).get('demo')==='1')demoDisplay();else if(mode==='vote'||mode==='display')startStream();else if(mode==='admin'){token?loadAdmin():login()}else{main.replaceChildren(el('h1','center','Votemera'),el('p','center muted','Локальная система интерактивного голосования'));const row=el('div','row');for(const [p,t] of [['vote','Терминал'],['display','Экран результатов'],['admin','Администрирование']])row.append(btn(t,()=>location.href='/'+p,''));main.append(row);api('/api/state').then(r=>r.json()).then(s=>{appearance(s);conn(true)}).catch(()=>conn(false))}
