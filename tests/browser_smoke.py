@@ -9,9 +9,10 @@ with sync_playwright() as p:
     display=browser.new_page(viewport={'width':1920,'height':1080})
     errors=[]
     for page in [admin,vote,display]:page.on('pageerror',lambda e:errors.append(str(e)))
-    auth={'Authorization':'Bearer test-secret'}
-    e=admin.request.post(BASE+'/api/admin/event',headers=auth,data={'title':'Анкета тест','rounds':['До','После'],'questions':[{'question':'Используете ИИ?','options':[{'label':'Да','color':'#16845b'},{'label':'Нет','color':'#df5363'}]},{'question':'Время подготовки?','confirm':True,'options':[{'label':'Мало','color':'#16845b'},{'label':'Много','color':'#df5363'}]}]}).json()
-    assert admin.request.post(BASE+'/api/admin/control',headers=auth,data={'event':e['id'],'round':e['round'],'opened':True,'display':'live'}).ok
+    api=p.request.new_context()
+    assert api.post(BASE+'/api/admin/login',data={'password':'test-secret'}).ok
+    e=api.post(BASE+'/api/admin/event',data={'title':'Анкета тест','rounds':['До','После'],'questions':[{'question':'Используете ИИ?','options':[{'label':'Да','color':'#16845b'},{'label':'Нет','color':'#df5363'}]},{'question':'Время подготовки?','confirm':True,'options':[{'label':'Мало','color':'#16845b'},{'label':'Много','color':'#df5363'}]}]}).json()
+    assert api.post(BASE+'/api/admin/control',data={'event':e['id'],'round':e['round'],'opened':True,'display':'live'}).ok
     admin.goto(BASE+'/admin'); admin.get_by_label('Пароль администратора').fill('test-secret'); admin.get_by_role('button',name='Войти').click()
     expect(admin.get_by_role('heading',name='Управление мероприятием',exact=True)).to_be_visible()
     vote.goto(BASE+'/vote'); display.goto(BASE+'/display')
@@ -25,10 +26,10 @@ with sync_playwright() as p:
     vote.get_by_role('button',name='Нет',exact=True).tap();vote.get_by_role('button',name='Много',exact=True).tap();vote.get_by_role('button',name='Отправить ответы').tap()
     expect(display.locator('.total-number')).to_have_text('2')
     expect(admin.locator('.overview-kpi').filter(has_text='Получено анкет').locator('strong')).to_have_text('2')
-    before=admin.request.get(BASE+'/api/admin/state',headers=auth).json()
+    before=admin.request.get(BASE+'/api/admin/state').json()
     admin.locator('[data-section=overview] [data-display-mode=analysis]').click()
     expect(display.get_by_role('heading',name='Связь ответов')).to_be_visible()
-    after=admin.request.get(BASE+'/api/admin/state',headers=auth).json()
+    after=admin.request.get(BASE+'/api/admin/state').json()
     assert (after['opened'],after['round'],after['epoch'])==(before['opened'],before['round'],before['epoch'])
     expect(display.get_by_text('100,0 п. п.')).to_be_visible()
     admin.get_by_text('Перекрёстный анализ',exact=True).click()
@@ -46,5 +47,6 @@ with sync_playwright() as p:
     assert not errors,errors
     if os.getenv('SCREENSHOT_DIR'):
         for name,page in [('admin',admin),('display',display),('vote',vote)]:page.screenshot(path=os.path.join(os.environ['SCREENSHOT_DIR'],name+'.png'))
+    api.dispose()
     browser.close()
     print('Chromium smoke test: OK')

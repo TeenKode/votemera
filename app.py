@@ -8,6 +8,7 @@ import hashlib
 import secrets
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -25,8 +26,17 @@ from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
+
+import operator_sessions as sessions
+from backup_restore import prepare_data, schema
+from poll_results import (analysis_config, cross_results, external_round, external_source, meta,
+                          presentation_config, questions, results)
+from storage_schema import ACCESS_MIGRATIONS, DATA_MIGRATIONS, migrate
+from voting import deadline, is_open, record_ballot, record_vote, terminal_locked
 
 ROOT = Path(__file__).resolve().parent
+LOG = logging.getLogger(__name__)
 VERSION = (ROOT / 'VERSION').read_text().strip()
 DB = Path(os.getenv('VOTEMERA_DB', str(ROOT / 'data' / 'votemera.db')))
 ADMIN = os.getenv('VOTEMERA_ADMIN_PASSWORD', '')
@@ -36,7 +46,6 @@ UPDATE_REQUEST = Path('/var/lib/votemera/update-request')
 UPDATE_REMOTE = 'https://github.com/TeenKode/votemera.git'
 AUTH_FAILURES = OrderedDict()
 AUTH_LOCK = threading.Lock()
-VERIFIED_ADMINS = OrderedDict()
 VERIFIED_KEYS = OrderedDict()
 KEY_CACHE_LOCK = threading.Lock()
 STREAM_LOCK = threading.Lock()
@@ -92,14 +101,13 @@ def password_hash(value,salt,rounds=PASSWORD_ROUNDS):
 
 def init_access():
     with access_db(True) as c:
-        c.execute('CREATE TABLE IF NOT EXISTS access_settings(id INTEGER PRIMARY KEY CHECK(id=1),password_salt BLOB NOT NULL,password_hash TEXT NOT NULL,key_salt BLOB NOT NULL,required INTEGER NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS terminal_keys(id INTEGER PRIMARY KEY,label TEXT NOT NULL,digest TEXT UNIQUE NOT NULL,created REAL NOT NULL,enabled INTEGER NOT NULL DEFAULT 1)')
-        c.execute('CREATE TABLE IF NOT EXISTS yandex_credentials(id INTEGER PRIMARY KEY CHECK(id=1),org TEXT NOT NULL,token TEXT NOT NULL,revision TEXT NOT NULL)')
+        migrate(c, ACCESS_MIGRATIONS)
         if c.execute('SELECT 1 FROM access_settings WHERE id=1').fetchone(): return
         salt=secrets.token_bytes(32); key_salt=secrets.token_bytes(32)
         c.execute('INSERT INTO access_settings VALUES(1,?,?,?,?)',(salt,password_hash(ADMIN,salt) if ADMIN else '',key_salt,int(bool(TERMINAL))))
         if TERMINAL:
-            c.execute('INSERT INTO terminal_keys(label,digest,created) VALUES(?,?,?)',('Первоначальный ключ',password_hash(TERMINAL,key_salt,KEY_ROUNDS),time.time()))
+            c.execute('INSERT INTO terminal_keys(label,digest,created,device_id) VALUES(?,?,?,?)',
+                      ('Первоначальный ключ',password_hash(TERMINAL,key_salt,KEY_ROUNDS),time.time(),uuid4().hex))
 
 def access_required():
     with access_db() as c:
@@ -110,19 +118,16 @@ def verify_admin(value):
         row=c.execute('SELECT password_salt,password_hash FROM access_settings WHERE id=1').fetchone()
     if not row['password_hash']: fail(503,'Пароль администратора не настроен на сервере')
     if len(value)>512: return False
-    fingerprint=hashlib.sha256(value.encode()).digest()
-    cache_key=(fingerprint,row['password_salt'],row['password_hash'])
-    if cache_key in VERIFIED_ADMINS: return True
-    valid=secret_eq(password_hash(value,row['password_salt']),row['password_hash'])
-    if valid:
-        VERIFIED_ADMINS[cache_key]=True
-        while len(VERIFIED_ADMINS)>16: VERIFIED_ADMINS.popitem(last=False)
-    return valid
+    return secret_eq(password_hash(value,row['password_salt']),row['password_hash'])
+
+def replace_password(c, value):
+    salt=secrets.token_bytes(32)
+    c.execute('UPDATE access_settings SET password_salt=?,password_hash=? WHERE id=1',(salt,password_hash(value,salt)))
+    c.execute('DELETE FROM access_sessions')
 
 def set_admin_password(value):
-    salt=secrets.token_bytes(32)
     with access_db(True) as c:
-        c.execute('UPDATE access_settings SET password_salt=?,password_hash=? WHERE id=1',(salt,password_hash(value,salt)))
+        replace_password(c,value)
 
 def terminal_digest(c,value):
     salt=c.execute('SELECT key_salt FROM access_settings WHERE id=1').fetchone()[0]
@@ -136,37 +141,8 @@ def checked_secret(value,minimum=8):
 def init():
     with db(transaction=False) as c:
         c.execute('PRAGMA journal_mode=WAL')
-        c.executescript('''CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL, active_event INTEGER, active_round INTEGER, opened INTEGER NOT NULL DEFAULT 0, epoch TEXT NOT NULL DEFAULT '', display TEXT NOT NULL DEFAULT 'live');
-        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, title TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL, created REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS rounds(id INTEGER PRIMARY KEY, event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE, name TEXT NOT NULL, position INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS votes(id INTEGER PRIMARY KEY, round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE, choice INTEGER NOT NULL, nonce TEXT NOT NULL UNIQUE, terminal TEXT NOT NULL, created REAL NOT NULL);
-        CREATE INDEX IF NOT EXISTS votes_round ON votes(round_id,choice);
-        CREATE INDEX IF NOT EXISTS votes_terminal ON votes(terminal,created);
-        ''')
-        if 'questions' not in [r['name'] for r in c.execute('PRAGMA table_info(events)')]:
-            c.execute('ALTER TABLE events ADD COLUMN questions TEXT')
-        if 'question_index' not in [r['name'] for r in c.execute('PRAGMA table_info(votes)')]:
-            c.execute('ALTER TABLE votes ADD COLUMN question_index INTEGER NOT NULL DEFAULT 0')
-        if 'ballot_id' not in [r['name'] for r in c.execute('PRAGMA table_info(votes)')]:
-            # Recover exact v0.2/v0.3 links from deterministic nonces, never from time proximity.
-            c.execute('BEGIN IMMEDIATE')
-            c.execute('ALTER TABLE votes ADD COLUMN ballot_id TEXT')
-            for v in c.execute('SELECT * FROM votes WHERE question_index=0').fetchall():
-                c.execute('UPDATE votes SET ballot_id=? WHERE id=?',(v['nonce'],v['id']))
-                for i in range(1,12):
-                    n=hashlib.sha256(('ballot:'+v['nonce']+':'+str(i)).encode()).hexdigest()[:32]
-                    c.execute('UPDATE votes SET ballot_id=? WHERE nonce=? AND round_id=? AND question_index=? AND terminal=? AND created=?',(v['nonce'],n,v['round_id'],i,v['terminal'],v['created']))
-            c.commit()
-        c.execute('CREATE INDEX IF NOT EXISTS votes_ballot ON votes(round_id,ballot_id,question_index)')
-        c.execute('CREATE TABLE IF NOT EXISTS analysis_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE, first_q INTEGER NOT NULL, second_q INTEGER NOT NULL, chart TEXT NOT NULL)')
-        c.execute('CREATE TABLE IF NOT EXISTS presentation_config(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,data TEXT NOT NULL)')
-        c.execute('CREATE INDEX IF NOT EXISTS votes_question ON votes(round_id,question_index,choice)')
-        c.execute('CREATE TABLE IF NOT EXISTS event_meta(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,archived INTEGER NOT NULL DEFAULT 0,template INTEGER NOT NULL DEFAULT 0,brand TEXT NOT NULL DEFAULT "",accent TEXT NOT NULL DEFAULT "",logo TEXT NOT NULL DEFAULT "")')
-        c.execute('CREATE TABLE IF NOT EXISTS runtime_config(id INTEGER PRIMARY KEY CHECK(id=1),deadline REAL)')
-        c.execute('INSERT OR IGNORE INTO runtime_config(id) VALUES(1)')
-        c.execute('CREATE TABLE IF NOT EXISTS terminal_config(id TEXT PRIMARY KEY,label TEXT NOT NULL DEFAULT "",locked INTEGER NOT NULL DEFAULT 0,event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,revision INTEGER NOT NULL DEFAULT 0)')
-        c.execute('CREATE TABLE IF NOT EXISTS yandex_source(event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE, org TEXT NOT NULL, form_id TEXT NOT NULL, spec TEXT NOT NULL, date_from TEXT NOT NULL, date_to TEXT NOT NULL, interval INTEGER NOT NULL, revision TEXT NOT NULL, aggregate TEXT NOT NULL, last_sync REAL, error TEXT NOT NULL DEFAULT "", enabled INTEGER NOT NULL DEFAULT 1)')
-        c.execute('CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,created REAL NOT NULL,action TEXT NOT NULL,detail TEXT NOT NULL)')
+    with db(True) as c:
+        migrate(c, DATA_MIGRATIONS)
         c.execute('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)',(json.dumps(DEFAULTS),))
         if not c.execute('SELECT 1 FROM events LIMIT 1').fetchone():
             e=c.execute('INSERT INTO events(title,question,options,created) VALUES(?,?,?,?)',('Педагогический совет','Готовы ли вы использовать искусственный интеллект в профессиональной деятельности?',json.dumps([{'label':'Да','color':COLORS[0]},{'label':'Нет','color':COLORS[1]}]),time.time())).lastrowid
@@ -177,19 +153,31 @@ def init():
 
 def fail(status,msg): raise HTTPException(status,msg)
 def secret_eq(a,b): return hmac.compare_digest(a.encode(),b.encode())
-def admin(request: Request, authorization: str = Header(default='')):
+def admin(request: Request):
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        sessions.check_origin(request)
+    token = request.cookies.get(sessions.COOKIE, '')
+    if token:
+        with access_db() as c:
+            if sessions.verify(c, token): return
+    fail(401, 'Войдите в панель администратора')
+
+def new_admin_session(request, password):
     address=request.client.host if request.client else 'unknown'
     now=time.monotonic()
-    with AUTH_LOCK:
+    with AUTH_LOCK, ACCESS_LOCK:
         n,until=AUTH_FAILURES.get(address,(0,0))
         if until<=now: n=0; until=now+60
         if n>=10: fail(429,'Слишком много попыток входа. Повторите через минуту.')
-        if not authorization.startswith('Bearer ') or not verify_admin(authorization[7:]):
+        if not verify_admin(password):
             AUTH_FAILURES[address]=(n+1,until)
             AUTH_FAILURES.move_to_end(address)
             while len(AUTH_FAILURES)>4096: AUTH_FAILURES.popitem(last=False)
             fail(401,'Неверный пароль')
         AUTH_FAILURES.pop(address,None)
+        with access_db(True) as c:
+            return sessions.issue(c)
+
 def terminal(x_terminal_key: str = Header(default='')):
     with access_db() as c:
         required=c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]
@@ -199,12 +187,12 @@ def terminal(x_terminal_key: str = Header(default='')):
         fingerprint=(hashlib.sha256(x_terminal_key.encode()).digest(),salt)
         with KEY_CACHE_LOCK: digest=VERIFIED_KEYS.get(fingerprint)
         if digest is None: digest=password_hash(x_terminal_key,salt,KEY_ROUNDS)
-        row=c.execute('SELECT id FROM terminal_keys WHERE digest=? AND enabled=1',(digest,)).fetchone()
+        row=c.execute('SELECT id,device_id FROM terminal_keys WHERE digest=? AND enabled=1',(digest,)).fetchone()
         if not row: fail(403,'Неверный или отключённый ключ терминала')
         with KEY_CACHE_LOCK:
             VERIFIED_KEYS[fingerprint]=digest
             while len(VERIFIED_KEYS)>128: VERIFIED_KEYS.popitem(last=False)
-        return row['id']
+        return row
 
 def clean(s):
     s=s.strip()
@@ -270,6 +258,9 @@ class PasswordChange(BaseModel):
     current: str = Field(max_length=512)
     password: str = Field(min_length=8,max_length=128)
 
+class AdminLogin(BaseModel):
+    password: str = Field(max_length=512)
+
 class KeyCreate(BaseModel):
     label: str = Field(min_length=1,max_length=80)
     key: str | None = Field(default=None,max_length=128)
@@ -298,9 +289,6 @@ class Ballot(BaseModel):
     nonce: str = Field(pattern=r'^[a-f0-9]{32}$')
     terminal: str = Field(pattern=r'^[a-f0-9]{32}$')
 
-def questions(e):
-    return json.loads(e['questions']) if e['questions'] else [dict(question=e['question'],options=json.loads(e['options']))]
-
 def validate_event(e):
     raw=e.questions if e.questions is not None else ([Question(question=e.question,options=e.options)] if e.question is not None and e.options is not None else [])
     if not raw: fail(422,'Добавьте хотя бы один вопрос')
@@ -317,66 +305,17 @@ def validate_event(e):
     if any(len(n)>80 for n in names) or len(set(n.casefold() for n in names))!=len(names): fail(422,'Названия этапов должны быть уникальными и не длиннее 80 символов')
     return qs,names
 
-def external_source(c,eid):
-    return c.execute('SELECT * FROM yandex_source WHERE event_id=?',(eid,)).fetchone()
-
-def external_round(c,rid):
-    return c.execute('SELECT y.* FROM yandex_source y JOIN rounds r ON r.event_id=y.event_id WHERE r.id=?',(rid,)).fetchone()
-
-def results(c,rid,qs):
-    ext=external_round(c,rid)
-    if ext: return json.loads(ext['aggregate'])['results']
-    items=[dict(counts=[0]*len(q['options'])) for q in qs]
-    for v in c.execute('SELECT question_index,choice,count(*) n FROM votes WHERE round_id=? GROUP BY question_index,choice',(rid,)):
-        items[v['question_index']]['counts'][v['choice']]=v['n']
-    for x in items: x['total']=sum(x['counts'])
-    return items
-
-def analysis_config(c,eid,qs):
-    if len(qs)<2 or external_source(c,eid): return None
-    row=c.execute('SELECT first_q,second_q,chart FROM analysis_config WHERE event_id=?',(eid,)).fetchone()
-    if row and row['first_q']!=row['second_q'] and max(row['first_q'],row['second_q'])<len(qs):
-        return dict(first=row['first_q'],second=row['second_q'],chart=row['chart'])
-    return dict(first=0,second=1,chart='stack')
-
-def cross_results(c,rid,qs,first,second):
-    matrix=[[0]*len(qs[second]['options']) for _ in qs[first]['options']]
-    for v in c.execute('''SELECT a.choice x,b.choice y,count(*) n FROM votes a JOIN votes b
-        ON a.round_id=b.round_id AND a.ballot_id=b.ballot_id
-        WHERE a.round_id=? AND a.question_index=? AND b.question_index=? AND a.ballot_id IS NOT NULL
-        GROUP BY a.choice,b.choice''',(rid,first,second)):
-        matrix[v['x']][v['y']]=v['n']
-    totals=[sum(row) for row in matrix]
-    submitted=c.execute('SELECT count(*) FROM votes WHERE round_id=? AND question_index=0',(rid,)).fetchone()[0]
-    return dict(matrix=matrix,totals=totals,total=sum(totals),unpaired=max(0,submitted-sum(totals)))
-
-def presentation_config(c,eid,qs):
-    row=c.execute('SELECT data FROM presentation_config WHERE event_id=?',(eid,)).fetchone()
-    return json.loads(row['data']) if row else dict(order=list(range(len(qs))),slides=[],seconds=15)
-
 def audit(c,action,detail=''):
     c.execute('INSERT INTO audit_log(created,action,detail) VALUES(?,?,?)',(time.time(),action,str(detail)[:500]))
     c.execute('DELETE FROM audit_log WHERE id <= (SELECT max(id)-5000 FROM audit_log)')
 
-def meta(c,eid):
-    row=c.execute('SELECT archived,template,brand,accent,logo FROM event_meta WHERE event_id=?',(eid,)).fetchone()
-    return dict(row) if row else dict(archived=0,template=0,brand='',accent='',logo='')
-
-def deadline(c):
-    return c.execute('SELECT deadline FROM runtime_config WHERE id=1').fetchone()[0]
-
 def effective_open_for(s, end, *, now=None):
-    return bool(s['opened'] and (end is None or end > (time.time() if now is None else now)))
+    return is_open(s, end, time.time() if now is None else now)
 
 def effective_open(c,s):
     return effective_open_for(s, deadline(c))
 
-def terminal_allowed(c,tid,eid):
-    t=c.execute('SELECT locked,event_id FROM terminal_config WHERE id=?',(tid,)).fetchone()
-    if t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=eid)):
-        fail(423,'Терминал заблокирован или назначен другому мероприятию')
-
-def snapshot(c, private=False, voting=False):
+def snapshot(c, private=False, voting=False, catalogue=True):
     s=c.execute('SELECT * FROM settings WHERE id=1').fetchone()
     cfg=DEFAULTS | json.loads(s['data'])
     e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
@@ -384,7 +323,12 @@ def snapshot(c, private=False, voting=False):
     result=dict(settings=cfg, event=None, round=s['active_round'], opened=effective_open_for(s,end), deadline=end, epoch=s['epoch'], display=s['display'], version=VERSION, terminal_key_required=access_required())
     if e:
         qs=questions(e); options=qs[0]['options']; rounds=[]; ac=analysis_config(c,e['id'],qs); m=meta(c,e['id']); ext=external_source(c,e['id'])
-        if ext: result['external']=dict(provider='yandex',url='https://forms.yandex.ru/cloud/u/'+ext['form_id']+'/',last_sync=ext['last_sync'],stale=bool(ext['error']) or not ext['enabled'],enabled=bool(ext['enabled'])); result['opened']=False
+        if ext:
+            late = ext['last_sync'] is not None and time.time() - ext['last_sync'] > max(30, 2 * ext['interval'])
+            result['external'] = dict(provider='yandex', url='https://forms.yandex.ru/cloud/u/'+ext['form_id']+'/',
+                                      last_sync=ext['last_sync'], stale=bool(ext['error']) or not ext['enabled'] or late,
+                                      enabled=bool(ext['enabled']))
+            result['opened'] = False
         if m['brand']: cfg['brand']=m['brand']
         if m['accent']: cfg['accent']=m['accent']
         result['logo']=m['logo']
@@ -401,7 +345,7 @@ def snapshot(c, private=False, voting=False):
         if private: result['event']['meta']=m
         if private or (not voting and s['display'] in ('analysis','analysis_compare','presentation')): result['event']['analysis']=ac
         if not voting: result['event']['presentation']=presentation_config(c,e['id'],qs)
-    if private:
+    if private and catalogue:
         result['events']=[dict(x) for x in c.execute('SELECT e.id,e.title,e.question,e.created,coalesce(m.archived,0) archived,coalesce(m.template,0) template,(SELECT count(*) FROM rounds WHERE event_id=e.id) AS round_count,(SELECT count(*) FROM votes v JOIN rounds r ON r.id=v.round_id WHERE r.event_id=e.id AND v.question_index=0) AS total FROM events e LEFT JOIN event_meta m ON m.event_id=e.id ORDER BY e.id DESC')]
         for item in result['events']:
             ext=external_source(c,item['id'])
@@ -441,13 +385,16 @@ def health():
     return {'status':'ok','version':VERSION}
 @app.get('/api/state')
 def state(view: Literal['vote','display']='display'):
-    with db() as c: return snapshot(c,voting=view=='vote')
+    return Response(stream_snapshot(view), media_type='application/json')
+
 def stream_snapshot(view):
     # Coalesce expensive aggregate reads across simultaneous displays/terminals.
     with STREAM_LOCK:
         key=(str(DB),view,STREAM_REVISION); now=time.monotonic(); cached=STREAM_CACHE.get(key)
         if cached and now-cached[0]<.20: return cached[1]
-        with db() as c: data=json.dumps(snapshot(c,voting=view=='vote'),ensure_ascii=False,separators=(',',':'))
+        with db() as c:
+            data=json.dumps(snapshot(c,private=view=='admin',voting=view=='vote',catalogue=False),
+                            ensure_ascii=False,separators=(',',':'))
         if len(STREAM_CACHE)>8: STREAM_CACHE.clear()
         STREAM_CACHE[key]=(time.monotonic(),data)
         return data
@@ -470,74 +417,35 @@ async def stream(request:Request, view: Literal['vote','display']='display'):
                 yield 'event: heartbeat\ndata: {}\n\n'
             await asyncio.sleep(.25)
     return StreamingResponse(events(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no','Cache-Control':'no-store, no-transform'})
-@app.post('/api/vote',dependencies=[Depends(terminal)])
-def vote(v:Vote):
+@app.post('/api/vote')
+def vote(v: Vote, key=Depends(terminal)):
+    device_id = key['device_id'] if key else v.terminal
     with db(True) as c:
-        old=c.execute('SELECT * FROM votes WHERE nonce=?',(v.nonce,)).fetchone()
-        if old:
-            if (old['round_id'],old['choice'],old['terminal']) != (v.round,v.choice,v.terminal): fail(409,'Конфликт идентификатора')
-            return {'ok':True,'duplicate':True}
-        s=c.execute('SELECT * FROM settings').fetchone()
-        if external_source(c,s['active_event']): fail(409,'Заполните Яндекс Форму')
-        terminal_allowed(c,v.terminal,s['active_event'])
-        if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Повторите выбор.')
-        e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
-        if e and len(questions(e))!=1: fail(409,'Для нескольких вопросов отправьте анкету целиком')
-        if not e or v.choice>=len(questions(e)[0]['options']): fail(422,'Неизвестный вариант')
-        now=time.time(); cfg=DEFAULTS|json.loads(s['data'])
-        last=c.execute('SELECT max(created) FROM votes WHERE terminal=?',(v.terminal,)).fetchone()[0]
-        if last is not None and now-last<cfg['cooldown']/1000: fail(429,'Терминал ещё не готов')
-        c.execute('INSERT INTO votes(round_id,choice,nonce,terminal,created,ballot_id) VALUES(?,?,?,?,?,?)',(v.round,v.choice,v.nonce,v.terminal,now,v.nonce))
-    return {'ok':True,'duplicate':False}
-def valid_ballot(qs, choices):
-    if len(qs)!=len(choices): return False
-    for i,(q,n) in enumerate(zip(qs,choices)):
-        rule=q.get('show_if')
-        visible=not rule or choices[rule['question']]==rule['choice']
-        if visible:
-            if n is None or not 0<=n<len(q['options']): return False
-        elif n is not None: return False
-    return True
+        return record_vote(c, v, device_id, time.time(), DEFAULTS['cooldown'])
 
-@app.post('/api/ballot',dependencies=[Depends(terminal)])
-def ballot(v:Ballot):
-    # First answer uses the original nonce; remaining answers use deterministic, domain-separated nonces.
-    nonces=[v.nonce]+[hashlib.sha256(('ballot:'+v.nonce+':'+str(i)).encode()).hexdigest()[:32] for i in range(1,len(v.choices))]
+
+@app.post('/api/ballot')
+def ballot(v: Ballot, key=Depends(terminal)):
+    device_id = key['device_id'] if key else v.terminal
     with db(True) as c:
-        old=c.execute('SELECT * FROM votes WHERE nonce=?',(v.nonce,)).fetchone()
-        if old:
-            rows=c.execute('SELECT * FROM votes WHERE round_id=? AND ballot_id=?',(v.round,v.nonce)).fetchall()
-            expected={(i,n,nonces[i],v.terminal) for i,n in enumerate(v.choices) if n is not None}
-            if {(r['question_index'],r['choice'],r['nonce'],r['terminal']) for r in rows}!=expected: fail(409,'Конфликт идентификатора')
-            e=c.execute('SELECT events.* FROM events JOIN rounds ON rounds.event_id=events.id WHERE rounds.id=?',(v.round,)).fetchone()
-            if not e or not valid_ballot(questions(e),v.choices): fail(409,'Конфликт анкеты')
-            return {'ok':True,'duplicate':True}
-        s=c.execute('SELECT * FROM settings').fetchone()
-        if external_source(c,s['active_event']): fail(409,'Заполните Яндекс Форму')
-        terminal_allowed(c,v.terminal,s['active_event'])
-        if not effective_open(c,s) or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Начните заново.')
-        e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
-        qs=questions(e)
-        if not valid_ballot(qs,v.choices): fail(422,'Неверные ответы или пропуски анкеты')
-        now=time.time(); cfg=DEFAULTS|json.loads(s['data'])
-        last=c.execute('SELECT max(created) FROM votes WHERE terminal=?',(v.terminal,)).fetchone()[0]
-        if last is not None and now-last<cfg['cooldown']/1000: fail(429,'Терминал ещё не готов')
-        if any(c.execute('SELECT 1 FROM votes WHERE nonce=?',(n,)).fetchone() for n in nonces): fail(409,'Конфликт идентификатора')
-        c.executemany('INSERT INTO votes(round_id,choice,nonce,terminal,created,question_index,ballot_id) VALUES(?,?,?,?,?,?,?)',[(v.round,n,nonces[i],v.terminal,now,i,v.nonce) for i,n in enumerate(v.choices) if n is not None])
-    return {'ok':True,'duplicate':False}
+        return record_ballot(c, v, device_id, time.time(), DEFAULTS['cooldown'])
+
 
 @app.post('/api/terminal/heartbeat')
-def heartbeat(v:TerminalHeartbeat,key_id=Depends(terminal)):
-    now=time.monotonic()
+def heartbeat(v: TerminalHeartbeat, key=Depends(terminal)):
+    device_id = key['device_id'] if key else v.terminal
+    now = time.monotonic()
     with TERMINALS_LOCK:
-        TERMINALS[v.terminal]=(now,key_id)
-        TERMINALS.move_to_end(v.terminal)
+        TERMINALS[device_id] = (now, key['id'] if key else None)
+        TERMINALS.move_to_end(device_id)
         while TERMINALS and (len(TERMINALS)>4096 or next(iter(TERMINALS.values()))[0]<now-300):
             TERMINALS.popitem(last=False)
     with db() as c:
-        t=c.execute('SELECT * FROM terminal_config WHERE id=?',(v.terminal,)).fetchone()
-        e=c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]
-        return {'ok':True,'locked':bool(t and (t['locked'] or (t['event_id'] is not None and t['event_id']!=e))),'revision':t['revision'] if t else 0,'label':t['label'] if t else ''}
+        t = c.execute('SELECT * FROM terminal_config WHERE id=?', (device_id,)).fetchone()
+        e = c.execute('SELECT active_event FROM settings WHERE id=1').fetchone()[0]
+        return {'ok': True, 'device_id': device_id, 'locked': terminal_locked(t, e),
+                'revision': t['revision'] if t else 0, 'label': t['label'] if t else ''}
+
 
 @app.post('/api/display/heartbeat')
 def display_heartbeat(v:TerminalHeartbeat):
@@ -562,31 +470,55 @@ def terminal_status():
         if not any(r['device_id']==tid for r in rows): rows.append(dict(device_id=tid,id=tid[-8:],seconds_ago=None,online=False,key_name='',**{k:v for k,v in t.items() if k!='id'}))
     return {'online':sum(r['online'] for r in rows),'terminals':rows}
 
+@app.post('/api/admin/login')
+def login(v: AdminLogin, request: Request, response: Response):
+    sessions.check_origin(request)
+    token = new_admin_session(request, v.password)
+    sessions.set_cookie(response, request, token)
+    return {'ok': True}
+
+
+@app.post('/api/admin/logout')
+def logout(request: Request, response: Response):
+    sessions.check_origin(request)
+    fingerprint = sessions.token_hash(request.cookies.get(sessions.COOKIE, ''))
+    if fingerprint:
+        with access_db(True) as c:
+            c.execute('DELETE FROM access_sessions WHERE token_hash=?', (fingerprint,))
+    sessions.clear_cookie(response, request)
+    return {'ok': True}
+
+
 @app.put('/api/admin/password',dependencies=[Depends(admin)])
-def change_password(v:PasswordChange):
+def change_password(v: PasswordChange, request: Request, response: Response):
     value=checked_secret(v.password)
     with ACCESS_LOCK:
         if not verify_admin(v.current): fail(403,'Текущий пароль неверен')
-        set_admin_password(value)
+        with access_db(True) as c:
+            replace_password(c, value)
+            token = sessions.issue(c)
     with db(True) as c: audit(c,'Смена пароля администратора')
+    sessions.set_cookie(response, request, token)
     return {'ok':True}
 
 @app.get('/api/admin/keys',dependencies=[Depends(admin)])
 def list_keys():
     with access_db() as c:
-        return {'required':bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]),'keys':[dict(r) for r in c.execute('SELECT id,label,created,enabled FROM terminal_keys ORDER BY id')]}
+        return {'required':bool(c.execute('SELECT required FROM access_settings WHERE id=1').fetchone()[0]),'keys':[dict(r) for r in c.execute('SELECT id,label,created,enabled,device_id FROM terminal_keys ORDER BY id')]}
 
 @app.post('/api/admin/keys',dependencies=[Depends(admin)])
 def create_key(v:KeyCreate):
     value=checked_secret(v.key if v.key is not None else secrets.token_hex(16))
+    device_id = uuid4().hex
     with access_db(True) as c:
         if c.execute('SELECT count(*) FROM terminal_keys').fetchone()[0]>=100: fail(409,'Максимум 100 ключей')
         try:
-            kid=c.execute('INSERT INTO terminal_keys(label,digest,created) VALUES(?,?,?)',(clean(v.label),terminal_digest(c,value),time.time())).lastrowid
+            kid=c.execute('INSERT INTO terminal_keys(label,digest,created,device_id) VALUES(?,?,?,?)',
+                          (clean(v.label),terminal_digest(c,value),time.time(),device_id)).lastrowid
         except sqlite3.IntegrityError: fail(409,'Такой ключ уже существует')
         c.execute('UPDATE access_settings SET required=1 WHERE id=1')
     with db(True) as c: audit(c,'Создание ключа терминала',kid)
-    return {'id':kid,'key':value}
+    return {'id':kid,'key':value,'device_id':device_id}
 
 def forget_key_terminals(kid):
     with TERMINALS_LOCK:
@@ -623,6 +555,10 @@ def delete_key(kid:int):
 @app.get('/api/admin/state',dependencies=[Depends(admin)])
 def admin_state():
     with db() as c: return snapshot(c,private=True)
+
+@app.get('/api/admin/live', dependencies=[Depends(admin)])
+def admin_live_state():
+    return Response(stream_snapshot('admin'), media_type='application/json')
 @app.post('/api/admin/event',dependencies=[Depends(admin)])
 def new_event(e:Event):
     qs,names=validate_event(e)
@@ -691,12 +627,14 @@ def apply_control(c, s, eid, rid, opened, display, duration):
     changed = stage_changed or opened != was_open
     epoch = uuid4().hex if changed else s['epoch']
     if change_voting and (not opened or changed or duration is not None):
-        c.execute('UPDATE runtime_config SET deadline=? WHERE id=1', (now + duration if opened and duration else None,))
+        end = now + duration if opened and duration else None
+        c.execute('UPDATE runtime_config SET deadline=? WHERE id=1', (end,))
     if changed or s['display'] != display or duration is not None:
         audit(c, 'Управление этапом', f'Мероприятие {eid}, этап {rid}, открыто={opened}, экран={display}')
     c.execute('UPDATE settings SET active_event=?,active_round=?,opened=?,epoch=?,display=? WHERE id=1',
               (eid, rid, int(opened) if change_voting else s['opened'], epoch, display))
-    return snapshot(c, private=True)
+    return dict(event_id=eid, round=rid, opened=effective_open_for({'opened': opened}, end),
+                epoch=epoch, display=display, deadline=end)
 
 @app.post('/api/admin/control',dependencies=[Depends(admin)])
 def control(v:Control):
@@ -812,17 +750,19 @@ def request_update():
 @app.get('/api/admin/backup',dependencies=[Depends(admin)])
 def backup_database():
     import tempfile
-    with tempfile.TemporaryDirectory() as directory:
-        target=Path(directory)/'backup.db'
-        with db(transaction=False) as source, sqlite3.connect(target) as dest:
+    directory = Path(tempfile.mkdtemp(prefix='votemera-backup-'))
+    target = directory/'backup.db'
+    try:
+        with db(transaction=False) as source, closing(sqlite3.connect(target)) as dest:
             source.backup(dest)
-        data=target.read_bytes()
-    return Response(data,media_type='application/x-sqlite3',headers={'Content-Disposition':'attachment; filename="votemera-backup.db"'})
+        return FileResponse(target, media_type='application/x-sqlite3', filename='votemera-backup.db',
+                            background=BackgroundTask(shutil.rmtree, directory))
+    except BaseException:
+        shutil.rmtree(directory)
+        raise
 
 def restore_database(path):
     global STREAM_REVISION
-    def schema(c):
-        return set(tuple(r) for r in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
     with WRITE_LOCK:
         with db() as current:
             if effective_open(current,current.execute('SELECT * FROM settings WHERE id=1').fetchone()): fail(409,'Сначала закройте голосование')
@@ -833,18 +773,8 @@ def restore_database(path):
                 source.row_factory=sqlite3.Row
                 source.execute('PRAGMA trusted_schema=OFF')
                 source.execute('PRAGMA foreign_keys=ON')
-                # Previous backups may lack only the four additive v0.11 tables.
-                actual_schema=schema(source)
-                additions={'event_meta','runtime_config','terminal_config','audit_log','yandex_source'}
-                missing=expected_schema-actual_schema
-                if actual_schema-expected_schema or any(r[0]!='table' or r[1] not in additions for r in missing): fail(422,'Несовместимая схема базы')
-                for row in sorted(missing): source.execute(row[3])
-                source.execute('INSERT OR IGNORE INTO runtime_config(id) VALUES(1)')
-                if source.execute('PRAGMA quick_check').fetchone()[0]!='ok' or source.execute('PRAGMA foreign_key_check').fetchone(): fail(422,'Повреждённая база')
-                if source.execute('SELECT count(*) FROM settings').fetchone()[0]!=1: fail(422,'Некорректные настройки')
-                source.execute('UPDATE settings SET opened=0,epoch=?,display=? WHERE id=1',(uuid4().hex,'hidden'))
-                source.execute('UPDATE runtime_config SET deadline=NULL WHERE id=1')
-                source.execute('UPDATE yandex_source SET enabled=0,revision=?,error=?',(uuid4().hex,'Восстановлено из резервной копии; включите синхронизацию'))
+                source.execute('BEGIN IMMEDIATE')
+                prepare_data(source, expected_schema)
                 source.commit()
                 preview=snapshot(source,private=True)
                 if not preview['event'] or not any(r['id']==preview['round'] for r in preview['event']['rounds']): fail(422,'Нет корректного активного мероприятия')
@@ -1007,7 +937,6 @@ import yandex_forms as yf
 YF_LOCK=threading.Lock()
 YF_QUEUE_LOCK=threading.Lock()
 YF_DUE={}
-YF_MANUAL=set()
 
 class YandexCredentials(BaseModel):
     org: str
@@ -1055,7 +984,10 @@ def yf_period(start, end):
 def yf_status():
     creds=yf_credentials()
     with db() as c:
-        sources=[dict(event_id=r['event_id'],title=r['title'],form_id=r['form_id'],interval=r['interval'],enabled=bool(r['enabled']),last_sync=r['last_sync'],error=r['error'],total=json.loads(r['aggregate'])['total'],date_from=r['date_from'],date_to=r['date_to']) for r in c.execute('SELECT y.*,e.title FROM yandex_source y JOIN events e ON e.id=y.event_id ORDER BY e.id DESC')]
+        rows = c.execute('''SELECT y.*, e.title, j.state AS sync_state
+            FROM yandex_source y JOIN events e ON e.id=y.event_id
+            LEFT JOIN yandex_sync_jobs j ON y.event_id=j.event_id ORDER BY e.id DESC''')
+        sources=[dict(event_id=r['event_id'],title=r['title'],form_id=r['form_id'],interval=r['interval'],enabled=bool(r['enabled']),last_sync=r['last_sync'],error=r['error'],total=json.loads(r['aggregate'])['total'],date_from=r['date_from'],date_to=r['date_to'],sync_state=r['sync_state']) for r in rows]
     return {'connected':bool(creds),'org':creds['org'] if creds else '', 'org_header':yf.organization_header(creds['org']) if creds else None, 'sources':sources}
 
 @app.put('/api/admin/yandex',dependencies=[Depends(admin)])
@@ -1075,7 +1007,9 @@ def yf_connect(v:YandexCredentials):
 def yf_disconnect():
     with WRITE_LOCK:
         with access_db(True) as c:c.execute('DELETE FROM yandex_credentials')
-        with db(True) as c:c.execute("UPDATE yandex_source SET enabled=0,revision=?,error='Подключение отключено'",(uuid4().hex,))
+        with db(True) as c:
+            c.execute("UPDATE yandex_source SET enabled=0,revision=?,error='Подключение отключено'",(uuid4().hex,))
+            c.execute('DELETE FROM yandex_sync_jobs')
     return {'ok':True}
 
 @app.get('/api/admin/yandex/forms',dependencies=[Depends(admin)])
@@ -1165,10 +1099,12 @@ def yf_settings(eid:int,v:YandexSettings):
 
 @app.post('/api/admin/yandex/events/{eid}/sync',dependencies=[Depends(admin)])
 def yf_manual(eid:int):
-    with db() as c:
+    with db(True) as c:
         if not external_source(c,eid):fail(404,'Подключение не найдено')
-    # The worker does network I/O; no long HTTP request or blocked SSE loop.
-    with YF_QUEUE_LOCK: YF_MANUAL.add((str(DB),eid))
+        c.execute("""INSERT INTO yandex_sync_jobs(event_id,request_id,state,requested)
+            VALUES(?,?,'queued',?) ON CONFLICT(event_id) DO UPDATE SET
+            request_id=excluded.request_id,state='queued',requested=excluded.requested,finished=NULL""",
+            (eid, uuid4().hex, time.time()))
     return {'queued':True}
 
 def yf_sync_pending(stop):
@@ -1176,30 +1112,37 @@ def yf_sync_pending(stop):
     with db() as c:
         active = c.execute('''SELECT y.event_id,y.revision FROM yandex_source y
             JOIN settings s ON s.active_event=y.event_id WHERE s.id=1 AND y.enabled=1''').fetchone()
-    with YF_QUEUE_LOCK:
-        manual = {eid for path, eid in YF_MANUAL if path == database}
-        if len(YF_DUE) > 1000:
-            YF_DUE.clear()
-        candidates = [(eid, None) for eid in sorted(manual)]
-        if active and active['event_id'] not in manual:
-            key = (database, active['event_id'])
-            revision, due = YF_DUE.get(key, (None, 0))
-            if revision != active['revision'] or time.monotonic() >= due:
-                candidates.append((active['event_id'], active['revision']))
-
-    for eid, revision in candidates:
+        manual = c.execute("""SELECT event_id,request_id FROM yandex_sync_jobs
+            WHERE state IN ('queued','running') ORDER BY requested""").fetchall()
+    for job in manual:
         if stop.is_set():
             return
-        if revision is None:
-            with YF_QUEUE_LOCK:
-                YF_MANUAL.discard((database, eid))
-        yf_sync(eid, automatic_revision=revision)
+        with db(True) as c:
+            claimed = c.execute("""UPDATE yandex_sync_jobs SET state='running'
+                WHERE event_id=? AND request_id=? AND state IN ('queued','running')""",
+                (job['event_id'], job['request_id'])).rowcount
+        if not claimed:
+            continue
+        success = yf_sync(job['event_id'])
+        with db(True) as c:
+            c.execute('UPDATE yandex_sync_jobs SET state=?,finished=? WHERE event_id=? AND request_id=?',
+                      ('success' if success else 'failed', time.time(), job['event_id'], job['request_id']))
+
+    if stop.is_set() or not active or any(job['event_id'] == active['event_id'] for job in manual):
+        return
+    with YF_QUEUE_LOCK:
+        if len(YF_DUE) > 1000:
+            YF_DUE.clear()
+        revision, due = YF_DUE.get((database, active['event_id']), (None, 0))
+    if revision != active['revision'] or time.monotonic() >= due:
+        yf_sync(active['event_id'], automatic_revision=active['revision'])
 
 def yf_worker(stop):
     while not stop.wait(1):
         try:
             yf_sync_pending(stop)
         except Exception:
+            LOG.exception('Yandex Forms background sync failed')
             stop.wait(5)
 
 @app.get('/api/admin/yandex/events/{eid}/qr',dependencies=[Depends(admin)])

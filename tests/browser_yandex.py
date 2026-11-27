@@ -6,7 +6,6 @@ from playwright.sync_api import sync_playwright,expect
 ROOT=Path(__file__).resolve().parents[1]
 BASE='http://127.0.0.1:8767'
 SID='a'*24
-AUTH={'Authorization':'Bearer test-secret'}
 STUB=r"""
 import yandex_forms as yf
 import app,uvicorn
@@ -32,7 +31,7 @@ with tempfile.TemporaryDirectory() as d:
             time.sleep(.2)
         else:raise AssertionError('Mock server did not start')
         with sync_playwright() as p:
-            b=p.chromium.launch(args=['--no-sandbox'])
+            b=p.chromium.launch(executable_path=os.getenv('CHROMIUM') or None,args=['--no-sandbox'])
             a=b.new_page(viewport={'width':1366,'height':768})
             errors=[];a.on('pageerror',lambda e:errors.append(str(e)))
             a.goto(BASE+'/admin')

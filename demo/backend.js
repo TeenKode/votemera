@@ -26,12 +26,12 @@ const Demo=(()=>{
   if(e.analysis){const {first,second}=e.analysis,matrix=e.questions[first].options.map((_,i)=>e.questions[second].options.map((_,j)=>rows.filter(b=>b.choices[first]===i&&b.choices[second]===j).length));const totals=matrix.map(r=>r.reduce((a,b)=>a+b,0)),total=totals.reduce((a,b)=>a+b,0);item.cross={matrix,totals,total,unpaired:rows.length-total}}
   return item;
  }
- function snapshot(d,priv=false,vote=false){
+ function snapshot(d,priv=false,vote=false,catalogue=priv){
   const e=event(d),rounds=e.rounds.map(r=>{const include=priv||(!vote&&d.display!=='hidden'&&(['compare','analysis_compare','presentation'].includes(d.display)||r.id===d.round));return include?results(d,e,r):{...r}});
   const item={...detail(e),rounds};
   if(vote){delete item.analysis;delete item.presentation}else if(!priv&&!['analysis','analysis_compare','presentation'].includes(d.display))delete item.analysis;
   const s={settings:{...d.settings,...(priv?{}:{...(e.meta?.brand?{brand:e.meta.brand}:{}),...(e.meta?.accent?{accent:e.meta.accent}:{})})},event:item,round:d.round,opened:votingOpen(d),deadline:d.deadline??null,logo:e.meta?.logo||'',epoch:d.epoch,display:d.display,version:VERSION,terminal_key_required:false};
-  if(priv)s.events=d.events.map(e=>({id:e.id,title:e.title,question:e.questions[0].question,created:e.created,round_count:e.rounds.length,archived:e.meta?.archived||false,template:e.meta?.template||false,total:d.ballots.filter(b=>e.rounds.some(r=>r.id===b.round)).length})).reverse();return s;
+  if(catalogue)s.events=d.events.map(e=>({id:e.id,title:e.title,question:e.questions[0].question,created:e.created,round_count:e.rounds.length,archived:e.meta?.archived||false,template:e.meta?.template||false,total:d.ballots.filter(b=>e.rounds.some(r=>r.id===b.round)).length})).reverse();return s;
  }
  const json=(v,status=200)=>new Response(JSON.stringify(v),{status,headers:{'Content-Type':'application/json'}});
  const ok=()=>json({ok:true});
@@ -39,16 +39,18 @@ const Demo=(()=>{
  function validate(v){if(!v?.title?.trim()||!v.rounds?.length||!v.questions?.length||v.questions.length>12||v.rounds.length>12)error(422,'Заполните название, этапы и вопросы');for(const [i,q] of v.questions.entries()){if(!q.question.trim()||q.options.length<2||q.options.length>6||q.options.some(o=>!o.label.trim()))error(422,'Заполните текст вопросов и варианты');if(q.show_if&&(q.show_if.question>=i||q.show_if.question<0||q.show_if.choice>=v.questions[q.show_if.question].options.length||q.show_if.choice<0))error(422,'Неверное условие показа')} }
  function newEvent(d,v){validate(v);const e={id:d.nextEvent++,title:v.title.trim(),questions:v.questions,created:Date.now()/1000,rounds:v.rounds.map(name=>({id:d.nextRound++,name})),analysis:v.questions.length>1?{first:0,second:1,chart:'stack'}:null,presentation:{order:v.questions.map((_,i)=>i),slides:[],seconds:15}};d.events.push(e);return e}
  function csv(d,e,cross){const rows=cross?[['Этап','Группа','Ответ','Количество']]:[['Мероприятие','Вопрос','Этап','Вариант','Голоса','Доля (%)']];for(const r of e.rounds){const rs=results(d,e,r);if(cross){if(e.analysis)rs.cross.matrix.forEach((row,i)=>row.forEach((n,j)=>rows.push([r.name,e.questions[e.analysis.first].options[i].label,e.questions[e.analysis.second].options[j].label,n])))}else e.questions.forEach((q,i)=>q.options.forEach((o,j)=>rows.push([e.title,q.question,r.name,o.label,rs.results[i].counts[j],rs.results[i].total?(100*rs.results[i].counts[j]/rs.results[i].total).toFixed(1):0])))}const escape=v=>{let s=String(v);if(/^[=+\-@\t\r\n]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"'};return new Response('\ufeff'+rows.map(r=>r.map(escape).join(';')).join('\n'),{headers:{'Content-Type':'text/csv;charset=utf-8'}})}
+ function stage(d){return {event_id:d.active,round:d.round,opened:votingOpen(d),epoch:d.epoch,display:d.display,deadline:d.deadline??null}}
  function dispatch(path,method,v){
   const d=load(),u=new URL(path,'https://demo.invalid'),p=u.pathname;let m,r;
   if(p==='/api/state')return json(snapshot(d,false,u.searchParams.get('view')==='vote'));
   if(p==='/api/admin/state')return json(snapshot(d,true));
+  if(p==='/api/admin/live'&&method==='GET')return json(snapshot(d,true,false,false));
   if(p==='/api/admin/terminals') {const now=Date.now(),terminals=Object.entries(d.terminals).filter(([,t])=>now-t<300000).map(([id,t])=>({id:id.slice(-8),seconds_ago:Math.floor((now-t)/1000),online:now-t<25000,key_name:'Демо'}));return json({online:terminals.filter(t=>t.online).length,terminals})}
   if(p==='/api/terminal/heartbeat'){d.terminals[v.terminal]=Date.now();save(d);return ok()}
   if(p==='/api/ballot'){const e=event(d);if(d.ballots.some(b=>b.nonce===v.nonce))return json({ok:true,duplicate:true});if(!votingOpen(d)||d.round!==v.round||d.epoch!==v.epoch)error(409,'Этап изменился');if(v.choices.length!==e.questions.length||e.questions.some((q,i)=>visible(q,v.choices)?!Number.isInteger(v.choices[i])||v.choices[i]<0||v.choices[i]>=q.options.length:v.choices[i]!==null))error(422,'Неверные ответы');d.ballots.push({...v,created:Date.now()});save(d);return ok()}
   if(p==='/api/admin/live'){
    const display=v.display??d.display;
-   if(v.opened==null&&v.round==null&&v.duration==null){d.display=display;save(d);return json(snapshot(d,true))}
+   if(v.opened==null&&v.round==null&&v.duration==null){d.display=display;save(d);return json(stage(d))}
    return dispatch('/api/admin/control','POST',{event:d.active,round:v.round??d.round,opened:v.opened,display,duration:v.duration});
   }
   if(p==='/api/admin/control'){
@@ -60,7 +62,7 @@ const Demo=(()=>{
    if(changed)d.epoch=uid();
    if(changed||!opened||v.duration!=null)d.deadline=opened&&v.duration?now+v.duration:null;
    Object.assign(d,{active:v.event,round:v.round,opened,display:v.display});
-   save(d);return json(snapshot(d,true));
+   save(d);return json(stage(d));
   }
   if(p==='/api/admin/settings'){d.settings={...defaults,...v};save(d);return ok()}
   if(p==='/api/admin/event'&&method==='POST'){const e=newEvent(d,v);save(d);return json({id:e.id,round:e.rounds[0].id})}
