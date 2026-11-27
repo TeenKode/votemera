@@ -52,3 +52,77 @@ body[data-motion=subtle] .choice.selected .choice-indicator{transform:none}
 body[data-motion=off] *,body[data-motion=off] *::before,body[data-motion=off] *::after{animation:none!important;transition:none!important}
 body[data-motion=off] button:active,body[data-motion=off] .choice.selected .choice-indicator{transform:none!important}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}button:active,.choice.selected .choice-indicator{transform:none!important}}
+
+/* Fit public screens to their actual available area, including browser chrome.
+   A transform is a last-resort fit, not a clipping mask for the content. */
+body:is([data-mode=vote],[data-mode=display]){height:100vh;height:100dvh;min-height:0;max-height:100dvh;overflow:hidden}
+body:is([data-mode=vote],[data-mode=display]) header,body:is([data-mode=vote],[data-mode=display]) footer{flex:0 0 auto;padding:clamp(5px,1vh,12px) clamp(10px,2vw,32px);gap:8px;min-width:0}
+body:is([data-mode=vote],[data-mode=display]) .brand{flex:1;min-width:0;flex-wrap:nowrap}
+body:is([data-mode=vote],[data-mode=display]) .brand>div{min-width:0;overflow-wrap:anywhere}
+body:is([data-mode=vote],[data-mode=display]) .tools{flex:0 0 auto;gap:6px}
+body:is([data-mode=vote],[data-mode=display]) .tools button{padding:8px 12px}
+body:is([data-mode=vote],[data-mode=display]) footer{margin:0;font-size:12px;overflow-wrap:anywhere}
+body:is([data-mode=vote],[data-mode=display]) .screen-stage{position:relative;flex:1 1 0;min-width:0;min-height:0;overflow:hidden}
+.screen-stage>main{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) scale(var(--screen-scale,1));transform-origin:center;width:100%;max-width:none;min-height:100%;height:auto;margin:0;flex:none;padding:clamp(10px,1.8vmin,32px);overflow:visible}
+.screen-stage>main>*{min-width:0}
+.screen-stage .wait{padding:clamp(8px,3vh,40px) 0}
+.screen-stage .wait button{margin:5px}
+.screen-stage .vote-top{gap:5px}
+.screen-stage .vote-main{gap:clamp(8px,1.5vh,22px)}
+.screen-stage .vote-question{font-size:clamp(24px,4vmin,58px)}
+.screen-stage .question-description{font-size:clamp(15px,2.1vmin,24px)}
+.screen-stage .choices{gap:clamp(7px,1.3vmin,22px)}
+.screen-stage .choice{padding:clamp(9px,1.8vmin,28px);min-height:clamp(64px,16vh,200px);font-size:clamp(19px,3vmin,42px);gap:clamp(6px,1.2vmin,20px)}
+.screen-stage .choice-list .choice{min-height:clamp(48px,8vh,108px);font-size:clamp(17px,2.6vmin,34px)}
+.screen-stage .choices-2.choice-grid .choice{min-height:clamp(112px,29vh,300px);font-size:clamp(26px,5vmin,64px)}
+.screen-stage .choices-5.choice-grid .choice,.screen-stage .choices-6.choice-grid .choice{min-height:clamp(62px,13vh,170px)}
+.screen-stage .vote-nav{gap:8px}
+.screen-stage .vote-nav button{min-height:44px;padding:8px 14px}
+.screen-stage .display-main{gap:clamp(7px,1.4vh,18px)}
+.screen-stage .display-heading{gap:10px}
+.screen-stage .display-heading h1{font-size:clamp(24px,3.5vmin,52px);margin:4px 0 0}
+.screen-stage .display-totals{gap:6px}
+.screen-stage .total-tile{min-width:0;max-width:100%;padding:6px 12px;overflow-wrap:anywhere}
+.screen-stage .total-number{font-size:clamp(24px,3.8vmin,52px)}
+.screen-stage .display-controls{gap:7px;flex-wrap:wrap}
+.screen-stage .display-controls select{padding:6px 8px;max-width:min(460px,100%)}
+.screen-stage .display-nav button{min-height:36px;padding:5px 13px}
+.screen-stage .question-grid{gap:clamp(7px,1.3vmin,18px)}
+.screen-stage .question-single{width:100%;max-width:none;margin:0 auto}
+.screen-stage .question-group{padding:clamp(9px,1.6vmin,24px);gap:6px}
+.screen-stage .question-group h2{margin:0 0 3px;font-size:clamp(17px,2.5vmin,30px)}
+.screen-stage .spotlight .question-group h2{font-size:clamp(24px,3.3vmin,48px)}
+.screen-stage .round-panels{gap:8px}
+.screen-stage .result-stats{margin:5px 0;gap:3px}
+.screen-stage .result-stats .metric{padding:3px 0;gap:5px}
+.screen-stage .metric-label span{font-size:clamp(14px,2vmin,25px)}
+.screen-stage .spotlight .metric-label span{font-size:clamp(18px,2.7vmin,38px)}
+.screen-stage .result-stats .count{font-size:clamp(20px,2.8vmin,38px)}
+.screen-stage .spotlight .result-stats .count{font-size:clamp(26px,4vmin,60px)}
+.screen-stage .spotlight .result-stats .share{font-size:clamp(15px,2.3vmin,29px)}
+.screen-stage .stack{height:clamp(12px,2.1vh,27px)}
+.screen-stage .delta-panel{padding-top:6px}
+.screen-stage .delta-panel .delta{gap:5px}
+.screen-stage .cross-pair{padding:9px 14px;gap:12px}
+.screen-stage .cross-pair h2{font-size:clamp(17px,2.5vmin,30px)}
+.screen-stage .cross-rounds{grid-template-columns:minmax(0,1fr);gap:8px;margin-top:0}
+.screen-stage .cross-panel{gap:8px}
+.screen-stage .cross-legend{gap:6px 12px}
+.screen-stage .cross-group{gap:4px}
+.screen-stage .cross-group>.cross-top strong{font-size:clamp(15px,2vmin,24px);overflow-wrap:anywhere}
+.screen-stage .cross-values{grid-template-columns:repeat(auto-fit,minmax(min(100%,72px),1fr));gap:4px}
+.screen-stage .cross-value{padding:3px;gap:2px}
+.screen-stage .cross-value strong{font-size:clamp(16px,2.6vmin,32px)}
+.screen-stage .cross-main .cross-stack{height:clamp(14px,2.5vh,28px)}
+.screen-stage .cross-scroll{overflow:visible;min-width:0}
+.screen-stage .cross-table{min-width:0;width:100%;table-layout:fixed;border-spacing:3px}
+.screen-stage .cross-table th,.screen-stage .cross-table td{padding:clamp(3px,.7vmin,9px);overflow-wrap:anywhere}
+.screen-stage .heat-cell strong{font-size:clamp(13px,2.2vmin,30px)}
+.screen-stage .heat-cell small{font-size:clamp(11px,1.5vmin,17px)}
+.screen-stage .cross-insight{padding-top:5px;gap:3px}
+.screen-stage .cross-insight strong{font-size:clamp(22px,3.3vmin,46px)}
+.screen-stage .screen-pager{justify-content:flex-end}
+.screen-stage .vote-progress .skipped{background:var(--muted);opacity:.35}
+@media(min-width:900px){.screen-stage .vote-main{padding-inline:clamp(20px,5vw,100px)}.screen-stage .choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-height:650px){body:is([data-mode=vote],[data-mode=display]) .brand small{display:none}.screen-stage .vote-main{gap:8px}.screen-stage .choice{min-height:58px}.screen-stage .choice-list .choice{min-height:46px}.screen-stage .choices-2.choice-grid .choice{min-height:100px}.screen-stage .question-kicker{font-size:11px}}
+@media(max-width:600px){.screen-stage .choice-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.screen-stage .choice-index{display:none}.screen-stage .choice-indicator{font-size:20px}.screen-stage .cross-pair{gap:5px}.screen-stage .metric-values{gap:5px}.screen-stage .display-controls label{display:none}}
