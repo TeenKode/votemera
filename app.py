@@ -112,11 +112,15 @@ def clean(s):
 class Option(BaseModel):
     label: str = Field(min_length=1,max_length=80)
     color: str = Field(pattern=r'^#[0-9a-fA-F]{6}$')
+class Condition(BaseModel):
+    question: int = Field(ge=0,le=11)
+    choice: int = Field(ge=0,le=5)
 class Question(BaseModel):
     question: str = Field(min_length=1,max_length=300)
     options: list[Option] = Field(min_length=2,max_length=6)
     description: str = Field(default="",max_length=300)
     confirm: bool = False
+    show_if: Condition | None = None
 class Event(BaseModel):
     title: str = Field(min_length=1,max_length=120)
     question: str | None = Field(default=None,min_length=1,max_length=300)
@@ -169,7 +173,7 @@ class Vote(BaseModel):
 class Ballot(BaseModel):
     round: int
     epoch: str = Field(max_length=64)
-    choices: list[int] = Field(min_length=1,max_length=12)
+    choices: list[int | None] = Field(min_length=1,max_length=12)
     nonce: str = Field(pattern=r'^[a-f0-9]{32}$')
     terminal: str = Field(pattern=r'^[a-f0-9]{32}$')
 
@@ -183,7 +187,11 @@ def validate_event(e):
     for q in raw:
         opts=[dict(label=clean(o.label),color=o.color) for o in q.options]
         if len(set(o['label'].casefold() for o in opts))!=len(opts): fail(422,'Варианты ответа должны быть уникальными')
-        qs.append(dict(question=clean(q.question),options=opts,description=q.description.strip(),confirm=q.confirm))
+        item=dict(question=clean(q.question),options=opts,description=q.description.strip(),confirm=q.confirm)
+        if q.show_if:
+            if q.show_if.question>=len(qs) or q.show_if.choice>=len(qs[q.show_if.question]['options']): fail(422,'Условие должно ссылаться на вариант предыдущего вопроса')
+            item['show_if']=q.show_if.model_dump()
+        qs.append(item)
     names=[clean(n) for n in e.rounds]
     if any(len(n)>80 for n in names) or len(set(n.casefold() for n in names))!=len(names): fail(422,'Названия этапов должны быть уникальными и не длиннее 80 символов')
     return qs,names
@@ -294,6 +302,16 @@ def vote(v:Vote):
         if last is not None and now-last<cfg['cooldown']/1000: fail(429,'Терминал ещё не готов')
         c.execute('INSERT INTO votes(round_id,choice,nonce,terminal,created,ballot_id) VALUES(?,?,?,?,?,?)',(v.round,v.choice,v.nonce,v.terminal,now,v.nonce))
     return {'ok':True,'duplicate':False}
+def valid_ballot(qs, choices):
+    if len(qs)!=len(choices): return False
+    for i,(q,n) in enumerate(zip(qs,choices)):
+        rule=q.get('show_if')
+        visible=not rule or choices[rule['question']]==rule['choice']
+        if visible:
+            if n is None or not 0<=n<len(q['options']): return False
+        elif n is not None: return False
+    return True
+
 @app.post('/api/ballot',dependencies=[Depends(terminal)])
 def ballot(v:Ballot):
     # First answer uses the original nonce; remaining answers use deterministic, domain-separated nonces.
@@ -301,21 +319,22 @@ def ballot(v:Ballot):
     with db(True) as c:
         old=c.execute('SELECT * FROM votes WHERE nonce=?',(v.nonce,)).fetchone()
         if old:
-            rows=[c.execute('SELECT * FROM votes WHERE nonce=?',(n,)).fetchone() for n in nonces]
-            if any(not r or (r['round_id'],r['question_index'],r['choice'],r['terminal'])!=(v.round,i,v.choices[i],v.terminal) for i,r in enumerate(rows)): fail(409,'Конфликт идентификатора')
+            rows=c.execute('SELECT * FROM votes WHERE round_id=? AND ballot_id=?',(v.round,v.nonce)).fetchall()
+            expected={(i,n,nonces[i],v.terminal) for i,n in enumerate(v.choices) if n is not None}
+            if {(r['question_index'],r['choice'],r['nonce'],r['terminal']) for r in rows}!=expected: fail(409,'Конфликт идентификатора')
             e=c.execute('SELECT events.* FROM events JOIN rounds ON rounds.event_id=events.id WHERE rounds.id=?',(v.round,)).fetchone()
-            if not e or len(questions(e))!=len(v.choices): fail(409,'Конфликт анкеты')
+            if not e or not valid_ballot(questions(e),v.choices): fail(409,'Конфликт анкеты')
             return {'ok':True,'duplicate':True}
         s=c.execute('SELECT * FROM settings').fetchone()
         if not s['opened'] or s['active_round']!=v.round or s['epoch']!=v.epoch: fail(409,'Этап изменился или закрыт. Начните заново.')
         e=c.execute('SELECT * FROM events WHERE id=?',(s['active_event'],)).fetchone()
         qs=questions(e)
-        if len(v.choices)!=len(qs) or any(not 0<=n<len(q['options']) for n,q in zip(v.choices,qs)): fail(422,'Неверные ответы анкеты')
+        if not valid_ballot(qs,v.choices): fail(422,'Неверные ответы или пропуски анкеты')
         now=time.time(); cfg=DEFAULTS|json.loads(s['data'])
         last=c.execute('SELECT max(created) FROM votes WHERE terminal=?',(v.terminal,)).fetchone()[0]
         if last is not None and now-last<cfg['cooldown']/1000: fail(429,'Терминал ещё не готов')
         if any(c.execute('SELECT 1 FROM votes WHERE nonce=?',(n,)).fetchone() for n in nonces): fail(409,'Конфликт идентификатора')
-        c.executemany('INSERT INTO votes(round_id,choice,nonce,terminal,created,question_index,ballot_id) VALUES(?,?,?,?,?,?,?)',[(v.round,n,nonces[i],v.terminal,now,i,v.nonce) for i,n in enumerate(v.choices)])
+        c.executemany('INSERT INTO votes(round_id,choice,nonce,terminal,created,question_index,ballot_id) VALUES(?,?,?,?,?,?,?)',[(v.round,n,nonces[i],v.terminal,now,i,v.nonce) for i,n in enumerate(v.choices) if n is not None])
     return {'ok':True,'duplicate':False}
 
 @app.post('/api/terminal/heartbeat',dependencies=[Depends(terminal)])

@@ -237,3 +237,23 @@ def test_presentation_and_rehearsal(client):
     result=client.post('/api/admin/control',headers=AUTH,json=dict(event=rehearsal['id'],round=rehearsal['round'],opened=False,display='live')).json()
     assert all(r['total']==0 for r in result['event']['rounds'])
     assert result['event']['presentation']['order']==[1,0]
+
+def test_conditional_questions(client):
+    s=client.get('/api/admin/state',headers=AUTH).json(); opts=s['event']['options']
+    qs=[dict(question='Первый',options=opts),dict(question='Только если нет',options=opts,show_if={'question':0,'choice':1}),dict(question='Третий',options=opts)]
+    d=dict(title='Условная анкета',rounds=['До','После'],questions=qs)
+    bad={**d,'questions':[dict(qs[0],show_if={'question':0,'choice':0}),*qs[1:]]}
+    assert client.post('/api/admin/event',headers=AUTH,json=bad).status_code==422
+    eid=client.post('/api/admin/event',headers=AUTH,json=d).json()
+    s=client.post('/api/admin/control',headers=AUTH,json=dict(event=eid['id'],round=eid['round'],opened=True,display='live')).json()
+    v=send_ballot(client,s,[0,None,1])
+    assert client.post('/api/ballot',headers=KEY,json=v).json()['duplicate']
+    assert client.post('/api/ballot',headers=KEY,json={**v,'choices':[0,0,1]}).status_code==409
+    send_ballot(client,s,[1,0,1])
+    invalid={**payload(s),'choices':[1,None,0]};invalid.pop('choice')
+    assert client.post('/api/ballot',headers=KEY,json=invalid).status_code==422
+    r=client.get('/api/state').json()['event']['rounds'][0]
+    assert r['total']==2 and r['results'][1]['total']==1
+    activate(client,display='analysis')
+    cross=client.get('/api/state').json()['event']['rounds'][0]['cross']
+    assert cross['total']==1 and cross['unpaired']==1
